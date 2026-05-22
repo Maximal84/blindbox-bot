@@ -84,15 +84,6 @@ class BoxView(discord.ui.View):
 
             user_id = str(interaction.user.id)
 
-            # Controlla se l'utente ha già prenotato qualcosa in questa box
-            for v, info in box["variants"].items():
-                if info["reserved_by"] == user_id:
-                    await interaction.response.send_message(
-                        f"⚠️ Hai già prenotato **{v}** in questa box! Annulla prima quella prenotazione.",
-                        ephemeral=True
-                    )
-                    return
-
             # Controlla se la variante è ancora disponibile
             if box["variants"][variant]["reserved_by"] is not None:
                 await interaction.response.send_message(
@@ -134,25 +125,51 @@ class BoxView(discord.ui.View):
             return
 
         user_id = str(interaction.user.id)
-        found = None
-        for variant, info in box["variants"].items():
-            if info["reserved_by"] == user_id:
-                found = variant
-                break
+        user_variants = [v for v, info in box["variants"].items() if info["reserved_by"] == user_id]
 
-        if not found:
+        if not user_variants:
             await interaction.response.send_message("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
             return
 
-        box["variants"][found]["reserved_by"] = None
-        box["variants"][found]["reserved_at"] = None
-        save_data(data)
+        # Se ha una sola prenotazione, annulla direttamente
+        if len(user_variants) == 1:
+            found = user_variants[0]
+            box["variants"][found]["reserved_by"] = None
+            box["variants"][found]["reserved_at"] = None
+            save_data(data)
+            embed = build_embed(box, self.box_id)
+            self._build_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+            await interaction.followup.send(
+                f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**."
+            )
+            return
 
-        embed = build_embed(box, self.box_id)
-        self._build_buttons()
-        await interaction.response.edit_message(embed=embed, view=self)
-        await interaction.followup.send(
-            f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**."
+        # Se ha più prenotazioni, mostra un menu di selezione
+        select = discord.ui.Select(
+            placeholder="Quale variante vuoi annullare?",
+            options=[discord.SelectOption(label=v, value=v) for v in user_variants]
+        )
+
+        async def select_callback(select_interaction: discord.Interaction):
+            chosen = select.values[0]
+            data2 = load_data()
+            box2 = data2.get(self.box_id)
+            box2["variants"][chosen]["reserved_by"] = None
+            box2["variants"][chosen]["reserved_at"] = None
+            save_data(data2)
+            embed = build_embed(box2, self.box_id)
+            self._build_buttons()
+            await select_interaction.response.edit_message(embed=embed, view=self)
+            await select_interaction.followup.send(
+                f"↩️ **{select_interaction.user.display_name}** ha annullato la prenotazione di **{chosen}**."
+            )
+
+        select.callback = select_callback
+        cancel_view = discord.ui.View(timeout=30)
+        cancel_view.add_item(select)
+        await interaction.response.send_message(
+            "Quale prenotazione vuoi annullare?", view=cancel_view, ephemeral=True
         )
 
 
