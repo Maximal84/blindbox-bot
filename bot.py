@@ -220,9 +220,9 @@ class BlindBoxCog(commands.Cog):
     @app_commands.checks.has_permissions(manage_messages=True)
     async def newbox(self, interaction: discord.Interaction, nome: str, serie: str, varianti: str):
         variant_list = [v.strip() for v in varianti.split(",") if v.strip()]
-        if len(variant_list) not in [6, 8, 12]:
+        if len(variant_list) not in [6, 8, 9, 12]:
             await interaction.response.send_message(
-                f"⚠️ Le varianti devono essere 6, 8 o 12. Hai inserito {len(variant_list)}.", ephemeral=True
+                f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(variant_list)}.", ephemeral=True
             )
             return
 
