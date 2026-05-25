@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import json
+import time
 from datetime import datetime
 import httpx
 
@@ -37,7 +38,6 @@ def load_box(box_id: str) -> dict | None:
     return rows[0]
 
 def save_box(box_id: str, box: dict):
-    # Upsert (insert o update)
     url = f"{SUPABASE_URL}/rest/v1/boxes"
     headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
     payload = {
@@ -67,7 +67,7 @@ def update_message_id(box_id: str, message_id: str):
     headers = {**sb_headers(), "Prefer": "return=representation"}
     httpx.patch(url, headers=headers, json={"message_id": message_id})
 
-# ── Helpers embed ────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────
 def fmt_prezzo(prezzo) -> str:
     try:
         return f"{float(prezzo):.2f}€".replace(".", ",")
@@ -126,15 +126,18 @@ class BoxView(discord.ui.View):
         if not box:
             return
         variants = get_variants(box)
-        # Max 5 bottoni per riga, riga 0-3 per le varianti, riga 4 per annulla
-        for i, (variant, info) in enumerate(variants.items()):
+        variant_names = list(variants.keys())
+
+        for i, variant in enumerate(variant_names):
+            info = variants[variant]
             taken = info["reserved_by"] is not None
+            # custom_id corto: b{box_id}_v{indice} — sempre sotto 100 caratteri
             btn = discord.ui.Button(
                 label=f"{'✅' if taken else '🎁'} {variant}",
                 style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
-                custom_id=f"reserve_{self.box_id}_{variant}",
+                custom_id=f"b{self.box_id}_v{i}",
                 disabled=taken,
-                row=i // 5,  # riga 0: varianti 1-5, riga 1: varianti 6-10, ecc.
+                row=i // 5,
             )
             btn.callback = self._make_callback(variant)
             self.add_item(btn)
@@ -160,7 +163,7 @@ class BoxView(discord.ui.View):
 
             if variants[variant]["reserved_by"] is not None:
                 await interaction.response.send_message(
-                    f"⚠️ **{variant}** è già stata prenotata da qualcun altro. Scegli un'altra variante!",
+                    f"⚠️ **{variant}** è già stata prenotata! Scegli un'altra variante.",
                     ephemeral=True
                 )
                 return
@@ -177,7 +180,7 @@ class BoxView(discord.ui.View):
 
             await interaction.response.edit_message(embed=embed, view=self)
             await interaction.followup.send(
-                f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!", ephemeral=False
+                f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!"
             )
 
             if all_reserved:
@@ -199,7 +202,9 @@ class BoxView(discord.ui.View):
         user_variants = [v for v, info in variants.items() if info["reserved_by"] == user_id]
 
         if not user_variants:
-            await interaction.response.send_message("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
+            await interaction.response.send_message(
+                "ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True
+            )
             return
 
         if len(user_variants) == 1:
@@ -264,8 +269,9 @@ class BlindBoxCog(commands.Cog):
             )
             return
 
-        all_boxes = load_all_boxes()
-        box_id = f"{nome.lower().replace(' ', '_')}_{serie.lower().replace(' ', '_')}_{len(all_boxes)+1}"
+        # box_id numerico corto basato sul timestamp
+        box_id = str(int(time.time()))[-8:]
+
         box = {
             "name": nome,
             "series": serie,
@@ -359,7 +365,6 @@ class BlindBoxBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(BlindBoxCog(self))
         await self.tree.sync()
-        # Ripristina le view persistenti per tutte le box salvate su Supabase
         all_boxes = load_all_boxes()
         for box_id in all_boxes:
             self.add_view(BoxView(box_id))
