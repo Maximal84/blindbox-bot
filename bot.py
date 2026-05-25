@@ -7,12 +7,10 @@ import time
 from datetime import datetime
 import httpx
 
-# ── Configurazione ──────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ── Supabase REST helpers ────────────────────────────────────────
 def sb_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -51,7 +49,8 @@ def save_box(box_id: str, box: dict):
         "channel_id": box["channel_id"],
         "variants": json.dumps(box["variants"]),
     }
-    httpx.post(url, headers=headers, json=payload)
+    r = httpx.post(url, headers=headers, json=payload)
+    print(f"[SAVE_BOX] status={r.status_code} response={r.text[:200]}")
 
 def delete_box(box_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
@@ -67,7 +66,6 @@ def update_message_id(box_id: str, message_id: str):
     headers = {**sb_headers(), "Prefer": "return=representation"}
     httpx.patch(url, headers=headers, json={"message_id": message_id})
 
-# ── Helpers ──────────────────────────────────────────────────────
 def fmt_prezzo(prezzo) -> str:
     try:
         return f"{float(prezzo):.2f}€".replace(".", ",")
@@ -86,7 +84,6 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
     taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
     color = discord.Color.green() if taken == total else discord.Color.blurple()
     prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
-
     embed = discord.Embed(
         title=f"🎁 {box['name']} — {box['series']}",
         description=f"**{taken}/{total}** varianti prenotate  •  💰 **{prezzo_str} a variante**",
@@ -94,7 +91,6 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
         timestamp=datetime.fromisoformat(box["created_at"]),
     )
     embed.set_footer(text=f"ID box: {box_id}")
-
     lines = []
     for variant, info in variants.items():
         if info["reserved_by"]:
@@ -113,7 +109,6 @@ def build_summary(box: dict) -> str:
         lines.append(f"• **{variant}** → <@{uid}>")
     return "\n".join(lines)
 
-# ── View con bottoni varianti ────────────────────────────────────
 class BoxView(discord.ui.View):
     def __init__(self, box_id: str):
         super().__init__(timeout=None)
@@ -124,32 +119,38 @@ class BoxView(discord.ui.View):
         self.clear_items()
         box = load_box(self.box_id)
         if not box:
+            print(f"[BUILD_BUTTONS] box {self.box_id} non trovata!")
             return
         variants = get_variants(box)
         variant_names = list(variants.keys())
+        print(f"[BUILD_BUTTONS] box={self.box_id} varianti={variant_names}")
 
         for i, variant in enumerate(variant_names):
             info = variants[variant]
             taken = info["reserved_by"] is not None
-            # custom_id corto: b{box_id}_v{indice} — sempre sotto 100 caratteri
+            cid = f"b{self.box_id}_v{i}"
+            print(f"[BUILD_BUTTONS] bottone {i}: label='{variant}' custom_id='{cid}' ({len(cid)} chars) row={i//5}")
             btn = discord.ui.Button(
                 label=f"{'✅' if taken else '🎁'} {variant}",
                 style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
-                custom_id=f"b{self.box_id}_v{i}",
+                custom_id=cid,
                 disabled=taken,
                 row=i // 5,
             )
             btn.callback = self._make_callback(variant)
             self.add_item(btn)
 
+        cid_cancel = f"cx_{self.box_id}"
+        print(f"[BUILD_BUTTONS] bottone annulla: custom_id='{cid_cancel}' ({len(cid_cancel)} chars) row=4")
         cancel_btn = discord.ui.Button(
             label="❌ Annulla la mia prenotazione",
             style=discord.ButtonStyle.danger,
-            custom_id=f"cancel_{self.box_id}",
+            custom_id=cid_cancel,
             row=4,
         )
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
+        print(f"[BUILD_BUTTONS] totale bottoni aggiunti: {len(self.children)}")
 
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
@@ -157,38 +158,23 @@ class BoxView(discord.ui.View):
             if not box:
                 await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
                 return
-
             variants = get_variants(box)
             user_id = str(interaction.user.id)
-
             if variants[variant]["reserved_by"] is not None:
                 await interaction.response.send_message(
-                    f"⚠️ **{variant}** è già stata prenotata! Scegli un'altra variante.",
-                    ephemeral=True
-                )
+                    f"⚠️ **{variant}** è già stata prenotata!", ephemeral=True)
                 return
-
             variants[variant]["reserved_by"] = user_id
             variants[variant]["reserved_at"] = datetime.now().isoformat()
             update_variants(self.box_id, variants)
-
             box["variants"] = variants
             embed = build_embed(box, self.box_id)
             self._build_buttons()
-
             all_reserved = all(v["reserved_by"] is not None for v in variants.values())
-
             await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(
-                f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!"
-            )
-
+            await interaction.followup.send(f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
             if all_reserved:
-                summary = build_summary(box)
-                await interaction.channel.send(
-                    f"🏆 **Box completata!** Tutte le varianti sono state prenotate!\n\n{summary}"
-                )
-
+                await interaction.channel.send(f"🏆 **Box completata!**\n\n{build_summary(box)}")
         return callback
 
     async def cancel_callback(self, interaction: discord.Interaction):
@@ -196,17 +182,12 @@ class BoxView(discord.ui.View):
         if not box:
             await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
             return
-
         variants = get_variants(box)
         user_id = str(interaction.user.id)
         user_variants = [v for v, info in variants.items() if info["reserved_by"] == user_id]
-
         if not user_variants:
-            await interaction.response.send_message(
-                "ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True
-            )
+            await interaction.response.send_message("ℹ️ Nessuna prenotazione attiva.", ephemeral=True)
             return
-
         if len(user_variants) == 1:
             found = user_variants[0]
             variants[found]["reserved_by"] = None
@@ -216,39 +197,27 @@ class BoxView(discord.ui.View):
             embed = build_embed(box, self.box_id)
             self._build_buttons()
             await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(
-                f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**."
-            )
+            await interaction.followup.send(f"↩️ **{interaction.user.display_name}** ha annullato **{found}**.")
             return
-
         select = discord.ui.Select(
             placeholder="Quale variante vuoi annullare?",
             options=[discord.SelectOption(label=v, value=v) for v in user_variants]
         )
-
-        async def select_callback(select_interaction: discord.Interaction):
+        async def select_callback(si: discord.Interaction):
             chosen = select.values[0]
-            box2 = load_box(self.box_id)
-            variants2 = get_variants(box2)
-            variants2[chosen]["reserved_by"] = None
-            variants2[chosen]["reserved_at"] = None
-            update_variants(self.box_id, variants2)
-            box2["variants"] = variants2
-            embed = build_embed(box2, self.box_id)
-            self._build_buttons()
-            await select_interaction.response.edit_message(embed=embed, view=self)
-            await select_interaction.followup.send(
-                f"↩️ **{select_interaction.user.display_name}** ha annullato la prenotazione di **{chosen}**."
-            )
-
+            b2 = load_box(self.box_id)
+            v2 = get_variants(b2)
+            v2[chosen]["reserved_by"] = None
+            v2[chosen]["reserved_at"] = None
+            update_variants(self.box_id, v2)
+            b2["variants"] = v2
+            await si.response.edit_message(embed=build_embed(b2, self.box_id), view=self)
+            await si.followup.send(f"↩️ **{si.user.display_name}** ha annullato **{chosen}**.")
         select.callback = select_callback
-        cancel_view = discord.ui.View(timeout=30)
-        cancel_view.add_item(select)
-        await interaction.response.send_message(
-            "Quale prenotazione vuoi annullare?", view=cancel_view, ephemeral=True
-        )
+        cv = discord.ui.View(timeout=30)
+        cv.add_item(select)
+        await interaction.response.send_message("Quale prenotazione vuoi annullare?", view=cv, ephemeral=True)
 
-# ── Cog comandi ──────────────────────────────────────────────────
 class BlindBoxCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -265,17 +234,14 @@ class BlindBoxCog(commands.Cog):
         variant_list = [v.strip() for v in varianti.split(",") if v.strip()]
         if len(variant_list) not in [6, 8, 9, 12]:
             await interaction.response.send_message(
-                f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(variant_list)}.", ephemeral=True
-            )
+                f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(variant_list)}.", ephemeral=True)
             return
 
-        # box_id numerico corto basato sul timestamp
         box_id = str(int(time.time()))[-8:]
+        print(f"[NEWBOX] box_id={box_id} varianti={variant_list}")
 
         box = {
-            "name": nome,
-            "series": serie,
-            "prezzo": prezzo,
+            "name": nome, "series": serie, "prezzo": prezzo,
             "created_by": str(interaction.user.id),
             "created_at": datetime.now().isoformat(),
             "message_id": None,
@@ -285,12 +251,13 @@ class BlindBoxCog(commands.Cog):
         save_box(box_id, box)
 
         view = BoxView(box_id)
+        print(f"[NEWBOX] view children count: {len(view.children)}")
         embed = build_embed(box, box_id)
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
-
         update_message_id(box_id, str(msg.id))
         interaction.client.add_view(view)
+        print(f"[NEWBOX] messaggio inviato id={msg.id}")
 
     @app_commands.command(name="listbox", description="Mostra tutte le box attive")
     async def listbox(self, interaction: discord.Interaction):
@@ -298,7 +265,6 @@ class BlindBoxCog(commands.Cog):
         if not all_boxes:
             await interaction.response.send_message("ℹ️ Nessuna box attiva al momento.", ephemeral=True)
             return
-
         lines = []
         for box_id, box in all_boxes.items():
             variants = get_variants(box)
@@ -307,7 +273,6 @@ class BlindBoxCog(commands.Cog):
             status = "✅ Completa" if taken == total else f"⏳ {taken}/{total}"
             prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
             lines.append(f"• **{box['name']} {box['series']}** — {status} — {prezzo_str}/var | ID: `{box_id}`")
-
         embed = discord.Embed(title="📦 Box attive", description="\n".join(lines), color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -319,7 +284,6 @@ class BlindBoxCog(commands.Cog):
         if not box:
             await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
             return
-
         variants = get_variants(box)
         prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
         lines = []
@@ -328,7 +292,6 @@ class BlindBoxCog(commands.Cog):
                 lines.append(f"✅ **{variant}** → <@{info['reserved_by']}> ({info['reserved_at'][:10]})")
             else:
                 lines.append(f"🎁 **{variant}** → *libera*")
-
         embed = discord.Embed(
             title=f"📋 {box['name']} — {box['series']}",
             description=f"💰 {prezzo_str} a variante\n\n" + "\n".join(lines),
@@ -352,9 +315,8 @@ class BlindBoxCog(commands.Cog):
     @deletebox.error
     async def permission_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message("🚫 Non hai i permessi per usare questo comando.", ephemeral=True)
+            await interaction.response.send_message("🚫 Non hai i permessi.", ephemeral=True)
 
-# ── Bot ──────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -364,18 +326,20 @@ class BlindBoxBot(commands.Bot):
 
     async def setup_hook(self):
         await self.add_cog(BlindBoxCog(self))
-        await self.tree.sync()
+        # Sincronizzazione immediata sul server specifico
+        guild = discord.Object(id=1442484265475506207)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
         all_boxes = load_all_boxes()
         for box_id in all_boxes:
             self.add_view(BoxView(box_id))
-        print(f"✅ Comandi slash sincronizzati. {len(all_boxes)} box ripristinate da Supabase.")
+        print(f"✅ Comandi slash sincronizzati sul server. {len(all_boxes)} box ripristinate da Supabase.")
 
     async def on_ready(self):
         print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id})")
 
 bot = BlindBoxBot()
 
-# ── Avvio ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("❌ DISCORD_TOKEN non trovato!")
