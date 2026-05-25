@@ -126,13 +126,15 @@ class BoxView(discord.ui.View):
         if not box:
             return
         variants = get_variants(box)
-        for variant, info in variants.items():
+        # Max 5 bottoni per riga, riga 0-3 per le varianti, riga 4 per annulla
+        for i, (variant, info) in enumerate(variants.items()):
             taken = info["reserved_by"] is not None
             btn = discord.ui.Button(
                 label=f"{'✅' if taken else '🎁'} {variant}",
                 style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
                 custom_id=f"reserve_{self.box_id}_{variant}",
                 disabled=taken,
+                row=i // 5,  # riga 0: varianti 1-5, riga 1: varianti 6-10, ecc.
             )
             btn.callback = self._make_callback(variant)
             self.add_item(btn)
