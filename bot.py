@@ -1,26 +1,71 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
 import os
+import json
 from datetime import datetime
+import httpx
 
 # ── Configurazione ──────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATA_FILE = "data/boxes.json"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ── Utilità JSON ────────────────────────────────────────────────
-def load_data():
-    os.makedirs("data", exist_ok=True)
-    if not os.path.exists(DATA_FILE):
+# ── Supabase REST helpers ────────────────────────────────────────
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def load_all_boxes() -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/boxes?select=*"
+    r = httpx.get(url, headers=sb_headers())
+    rows = r.json()
+    if not isinstance(rows, list):
         return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return {row["box_id"]: row for row in rows}
 
-def save_data(data):
-    os.makedirs("data", exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_box(box_id: str) -> dict | None:
+    url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}&select=*"
+    r = httpx.get(url, headers=sb_headers())
+    rows = r.json()
+    if not isinstance(rows, list) or len(rows) == 0:
+        return None
+    return rows[0]
+
+def save_box(box_id: str, box: dict):
+    # Upsert (insert o update)
+    url = f"{SUPABASE_URL}/rest/v1/boxes"
+    headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
+    payload = {
+        "box_id": box_id,
+        "name": box["name"],
+        "series": box["series"],
+        "prezzo": box["prezzo"],
+        "created_by": box["created_by"],
+        "created_at": box["created_at"],
+        "message_id": box.get("message_id"),
+        "channel_id": box["channel_id"],
+        "variants": json.dumps(box["variants"]),
+    }
+    httpx.post(url, headers=headers, json=payload)
+
+def delete_box(box_id: str):
+    url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
+    httpx.delete(url, headers=sb_headers())
+
+def update_variants(box_id: str, variants: dict):
+    url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
+    headers = {**sb_headers(), "Prefer": "return=representation"}
+    httpx.patch(url, headers=headers, json={"variants": json.dumps(variants)})
+
+def update_message_id(box_id: str, message_id: str):
+    url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
+    headers = {**sb_headers(), "Prefer": "return=representation"}
+    httpx.patch(url, headers=headers, json={"message_id": message_id})
 
 # ── Helpers embed ────────────────────────────────────────────────
 def fmt_prezzo(prezzo) -> str:
@@ -29,9 +74,16 @@ def fmt_prezzo(prezzo) -> str:
     except Exception:
         return f"{prezzo}€"
 
+def get_variants(box: dict) -> dict:
+    v = box["variants"]
+    if isinstance(v, str):
+        return json.loads(v)
+    return v
+
 def build_embed(box: dict, box_id: str) -> discord.Embed:
-    total = len(box["variants"])
-    taken = sum(1 for v in box["variants"].values() if v["reserved_by"] is not None)
+    variants = get_variants(box)
+    total = len(variants)
+    taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
     color = discord.Color.green() if taken == total else discord.Color.blurple()
     prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
 
@@ -44,7 +96,7 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
     embed.set_footer(text=f"ID box: {box_id}")
 
     lines = []
-    for variant, info in box["variants"].items():
+    for variant, info in variants.items():
         if info["reserved_by"]:
             lines.append(f"✅ ~~{variant}~~ — *prenotata*")
         else:
@@ -53,9 +105,10 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
     return embed
 
 def build_summary(box: dict) -> str:
+    variants = get_variants(box)
     prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
     lines = [f"**Riepilogo prenotazioni** — {prezzo_str} a variante:"]
-    for variant, info in box["variants"].items():
+    for variant, info in variants.items():
         uid = info["reserved_by"]
         lines.append(f"• **{variant}** → <@{uid}>")
     return "\n".join(lines)
@@ -69,11 +122,11 @@ class BoxView(discord.ui.View):
 
     def _build_buttons(self):
         self.clear_items()
-        data = load_data()
-        box = data.get(self.box_id)
+        box = load_box(self.box_id)
         if not box:
             return
-        for variant, info in box["variants"].items():
+        variants = get_variants(box)
+        for variant, info in variants.items():
             taken = info["reserved_by"] is not None
             btn = discord.ui.Button(
                 label=f"{'✅' if taken else '🎁'} {variant}",
@@ -95,29 +148,30 @@ class BoxView(discord.ui.View):
 
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
-            data = load_data()
-            box = data.get(self.box_id)
+            box = load_box(self.box_id)
             if not box:
                 await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
                 return
 
+            variants = get_variants(box)
             user_id = str(interaction.user.id)
 
-            if box["variants"][variant]["reserved_by"] is not None:
+            if variants[variant]["reserved_by"] is not None:
                 await interaction.response.send_message(
                     f"⚠️ **{variant}** è già stata prenotata da qualcun altro. Scegli un'altra variante!",
                     ephemeral=True
                 )
                 return
 
-            box["variants"][variant]["reserved_by"] = user_id
-            box["variants"][variant]["reserved_at"] = datetime.now().isoformat()
-            save_data(data)
+            variants[variant]["reserved_by"] = user_id
+            variants[variant]["reserved_at"] = datetime.now().isoformat()
+            update_variants(self.box_id, variants)
 
+            box["variants"] = variants
             embed = build_embed(box, self.box_id)
             self._build_buttons()
 
-            all_reserved = all(v["reserved_by"] is not None for v in box["variants"].values())
+            all_reserved = all(v["reserved_by"] is not None for v in variants.values())
 
             await interaction.response.edit_message(embed=embed, view=self)
             await interaction.followup.send(
@@ -133,14 +187,14 @@ class BoxView(discord.ui.View):
         return callback
 
     async def cancel_callback(self, interaction: discord.Interaction):
-        data = load_data()
-        box = data.get(self.box_id)
+        box = load_box(self.box_id)
         if not box:
             await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
             return
 
+        variants = get_variants(box)
         user_id = str(interaction.user.id)
-        user_variants = [v for v, info in box["variants"].items() if info["reserved_by"] == user_id]
+        user_variants = [v for v, info in variants.items() if info["reserved_by"] == user_id]
 
         if not user_variants:
             await interaction.response.send_message("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
@@ -148,9 +202,10 @@ class BoxView(discord.ui.View):
 
         if len(user_variants) == 1:
             found = user_variants[0]
-            box["variants"][found]["reserved_by"] = None
-            box["variants"][found]["reserved_at"] = None
-            save_data(data)
+            variants[found]["reserved_by"] = None
+            variants[found]["reserved_at"] = None
+            update_variants(self.box_id, variants)
+            box["variants"] = variants
             embed = build_embed(box, self.box_id)
             self._build_buttons()
             await interaction.response.edit_message(embed=embed, view=self)
@@ -166,11 +221,12 @@ class BoxView(discord.ui.View):
 
         async def select_callback(select_interaction: discord.Interaction):
             chosen = select.values[0]
-            data2 = load_data()
-            box2 = data2.get(self.box_id)
-            box2["variants"][chosen]["reserved_by"] = None
-            box2["variants"][chosen]["reserved_at"] = None
-            save_data(data2)
+            box2 = load_box(self.box_id)
+            variants2 = get_variants(box2)
+            variants2[chosen]["reserved_by"] = None
+            variants2[chosen]["reserved_at"] = None
+            update_variants(self.box_id, variants2)
+            box2["variants"] = variants2
             embed = build_embed(box2, self.box_id)
             self._build_buttons()
             await select_interaction.response.edit_message(embed=embed, view=self)
@@ -206,9 +262,9 @@ class BlindBoxCog(commands.Cog):
             )
             return
 
-        data = load_data()
-        box_id = f"{nome.lower().replace(' ', '_')}_{serie.lower().replace(' ', '_')}_{len(data)+1}"
-        data[box_id] = {
+        all_boxes = load_all_boxes()
+        box_id = f"{nome.lower().replace(' ', '_')}_{serie.lower().replace(' ', '_')}_{len(all_boxes)+1}"
+        box = {
             "name": nome,
             "series": serie,
             "prezzo": prezzo,
@@ -218,30 +274,28 @@ class BlindBoxCog(commands.Cog):
             "channel_id": str(interaction.channel_id),
             "variants": {v: {"reserved_by": None, "reserved_at": None} for v in variant_list},
         }
-        save_data(data)
+        save_box(box_id, box)
 
         view = BoxView(box_id)
-        embed = build_embed(data[box_id], box_id)
+        embed = build_embed(box, box_id)
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
 
-        data[box_id]["message_id"] = str(msg.id)
-        save_data(data)
-
-        # Registra la view persistente nel bot
+        update_message_id(box_id, str(msg.id))
         interaction.client.add_view(view)
 
     @app_commands.command(name="listbox", description="Mostra tutte le box attive")
     async def listbox(self, interaction: discord.Interaction):
-        data = load_data()
-        if not data:
+        all_boxes = load_all_boxes()
+        if not all_boxes:
             await interaction.response.send_message("ℹ️ Nessuna box attiva al momento.", ephemeral=True)
             return
 
         lines = []
-        for box_id, box in data.items():
-            total = len(box["variants"])
-            taken = sum(1 for v in box["variants"].values() if v["reserved_by"] is not None)
+        for box_id, box in all_boxes.items():
+            variants = get_variants(box)
+            total = len(variants)
+            taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
             status = "✅ Completa" if taken == total else f"⏳ {taken}/{total}"
             prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
             lines.append(f"• **{box['name']} {box['series']}** — {status} — {prezzo_str}/var | ID: `{box_id}`")
@@ -253,15 +307,15 @@ class BlindBoxCog(commands.Cog):
     @app_commands.describe(box_id="ID della box (usa /listbox per trovarlo)")
     @app_commands.checks.has_permissions(manage_messages=True)
     async def boxinfo(self, interaction: discord.Interaction, box_id: str):
-        data = load_data()
-        box = data.get(box_id)
+        box = load_box(box_id)
         if not box:
             await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
             return
 
+        variants = get_variants(box)
         prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
         lines = []
-        for variant, info in box["variants"].items():
+        for variant, info in variants.items():
             if info["reserved_by"]:
                 lines.append(f"✅ **{variant}** → <@{info['reserved_by']}> ({info['reserved_at'][:10]})")
             else:
@@ -278,12 +332,11 @@ class BlindBoxCog(commands.Cog):
     @app_commands.describe(box_id="ID della box da eliminare")
     @app_commands.checks.has_permissions(administrator=True)
     async def deletebox(self, interaction: discord.Interaction, box_id: str):
-        data = load_data()
-        if box_id not in data:
+        box = load_box(box_id)
+        if not box:
             await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
             return
-        del data[box_id]
-        save_data(data)
+        delete_box(box_id)
         await interaction.response.send_message(f"🗑️ Box `{box_id}` eliminata.", ephemeral=True)
 
     @newbox.error
@@ -304,11 +357,11 @@ class BlindBoxBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(BlindBoxCog(self))
         await self.tree.sync()
-        # Ripristina le view persistenti per tutte le box salvate
-        data = load_data()
-        for box_id in data:
+        # Ripristina le view persistenti per tutte le box salvate su Supabase
+        all_boxes = load_all_boxes()
+        for box_id in all_boxes:
             self.add_view(BoxView(box_id))
-        print(f"✅ Comandi slash sincronizzati. {len(data)} box ripristinate.")
+        print(f"✅ Comandi slash sincronizzati. {len(all_boxes)} box ripristinate da Supabase.")
 
     async def on_ready(self):
         print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id})")
@@ -318,5 +371,7 @@ bot = BlindBoxBot()
 # ── Avvio ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not TOKEN:
-        raise ValueError("❌ DISCORD_TOKEN non trovato! Controlla il file .env")
+        raise ValueError("❌ DISCORD_TOKEN non trovato!")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise ValueError("❌ SUPABASE_URL o SUPABASE_KEY non trovati!")
     bot.run(TOKEN)
