@@ -9,7 +9,7 @@ import asyncio
 from datetime import datetime
 import httpx
 
-BOT_VERSION = "v15-diagnostica"
+BOT_VERSION = "v16-interaction-edit"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -175,16 +175,25 @@ class BoxView(discord.ui.View):
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
 
-    async def refresh_box_message(self, message: discord.Message, box: dict):
-        """Ricostruisce embed e bottoni dallo STESSO stato e aggiorna il messaggio."""
+    async def refresh_box_message(self, message: discord.Message, box: dict,
+                                    interaction: discord.Interaction | None = None):
+        """Ricostruisce embed e bottoni dallo STESSO stato e aggiorna il messaggio.
+        Se l'interazione arriva dal messaggio stesso, usa il canale di update nativo
+        delle interazioni (forza il re-render sui client)."""
         variants = get_variants(box)
         taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
         total = len(variants)
         print(f"[REFRESH] box={self.box_id} msg={message.id} stato={taken}/{total}")
         self.populate(box)
+        embed = build_embed(box, self.box_id)
         try:
-            await message.edit(embed=build_embed(box, self.box_id), view=self)
-            print(f"[REFRESH] box={self.box_id} edit OK")
+            if (interaction is not None and interaction.message is not None
+                    and interaction.message.id == message.id):
+                await interaction.edit_original_response(embed=embed, view=self)
+                print(f"[REFRESH] box={self.box_id} edit OK (via interazione)")
+            else:
+                await message.edit(embed=embed, view=self)
+                print(f"[REFRESH] box={self.box_id} edit OK (via messaggio)")
         except Exception as e:
             print(f"[REFRESH] box={self.box_id} edit FALLITO: {e}")
             raise
@@ -215,7 +224,7 @@ class BoxView(discord.ui.View):
 
             if variants[variant]["reserved_by"] is not None:
                 box["variants"] = variants
-                await self.refresh_box_message(interaction.message, box)
+                await self.refresh_box_message(interaction.message, box, interaction)
                 await interaction.followup.send(
                     f"⚠️ **{variant}** è già stata prenotata!", ephemeral=True)
                 return
@@ -230,7 +239,7 @@ class BoxView(discord.ui.View):
                 return
 
             box["variants"] = variants
-            await self.refresh_box_message(interaction.message, box)
+            await self.refresh_box_message(interaction.message, box, interaction)
             all_reserved = all(v["reserved_by"] is not None for v in variants.values())
 
         await interaction.followup.send(
@@ -314,7 +323,7 @@ class BoxView(discord.ui.View):
 
             if variants.get(variant, {}).get("reserved_by") != user_id:
                 box["variants"] = variants
-                await self.refresh_box_message(box_message, box)
+                await self.refresh_box_message(box_message, box, interaction)
                 await interaction.followup.send(
                     "⚠️ Questa prenotazione non risulta più tua.", ephemeral=True)
                 return
@@ -329,7 +338,7 @@ class BoxView(discord.ui.View):
                 return
 
             box["variants"] = variants
-            await self.refresh_box_message(box_message, box)
+            await self.refresh_box_message(box_message, box, interaction)
 
         await interaction.channel.send(
             f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{variant}**.")
