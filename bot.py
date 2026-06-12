@@ -9,6 +9,8 @@ import asyncio
 from datetime import datetime
 import httpx
 
+BOT_VERSION = "v15-diagnostica"
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -175,8 +177,17 @@ class BoxView(discord.ui.View):
 
     async def refresh_box_message(self, message: discord.Message, box: dict):
         """Ricostruisce embed e bottoni dallo STESSO stato e aggiorna il messaggio."""
+        variants = get_variants(box)
+        taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
+        total = len(variants)
+        print(f"[REFRESH] box={self.box_id} msg={message.id} stato={taken}/{total}")
         self.populate(box)
-        await message.edit(embed=build_embed(box, self.box_id), view=self)
+        try:
+            await message.edit(embed=build_embed(box, self.box_id), view=self)
+            print(f"[REFRESH] box={self.box_id} edit OK")
+        except Exception as e:
+            print(f"[REFRESH] box={self.box_id} edit FALLITO: {e}")
+            raise
 
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
@@ -533,7 +544,7 @@ class BlindBoxBot(commands.Bot):
         print(f"✅ Comandi slash sincronizzati. {len(all_boxes)} box ripristinate da Supabase.")
 
     async def on_ready(self):
-        print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id})")
+        print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id}) — VERSIONE: {BOT_VERSION}")
 
     async def close(self):
         if http_client:
