@@ -11,6 +11,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# Client HTTP asincrono condiviso
+http_client: httpx.AsyncClient | None = None
+
 def sb_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -19,23 +22,23 @@ def sb_headers():
         "Prefer": "return=representation",
     }
 
-def load_all_boxes() -> dict:
+async def load_all_boxes() -> dict:
     url = f"{SUPABASE_URL}/rest/v1/boxes?select=*"
-    r = httpx.get(url, headers=sb_headers())
+    r = await http_client.get(url, headers=sb_headers())
     rows = r.json()
     if not isinstance(rows, list):
         return {}
     return {row["box_id"]: row for row in rows}
 
-def load_box(box_id: str) -> dict | None:
+async def load_box(box_id: str) -> dict | None:
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}&select=*"
-    r = httpx.get(url, headers=sb_headers())
+    r = await http_client.get(url, headers=sb_headers())
     rows = r.json()
     if not isinstance(rows, list) or len(rows) == 0:
         return None
     return rows[0]
 
-def save_box(box_id: str, box: dict):
+async def save_box(box_id: str, box: dict):
     url = f"{SUPABASE_URL}/rest/v1/boxes"
     headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
     payload = {
@@ -49,22 +52,22 @@ def save_box(box_id: str, box: dict):
         "channel_id": box["channel_id"],
         "variants": json.dumps(box["variants"]),
     }
-    r = httpx.post(url, headers=headers, json=payload)
+    r = await http_client.post(url, headers=headers, json=payload)
     print(f"[SAVE_BOX] status={r.status_code}")
 
-def delete_box(box_id: str):
+async def delete_box_db(box_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
-    httpx.delete(url, headers=sb_headers())
+    await http_client.delete(url, headers=sb_headers())
 
-def update_variants(box_id: str, variants: dict):
+async def update_variants(box_id: str, variants: dict):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
     headers = {**sb_headers(), "Prefer": "return=representation"}
-    httpx.patch(url, headers=headers, json={"variants": json.dumps(variants)})
+    await http_client.patch(url, headers=headers, json={"variants": json.dumps(variants)})
 
-def update_message_id(box_id: str, message_id: str):
+async def update_message_id(box_id: str, message_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
     headers = {**sb_headers(), "Prefer": "return=representation"}
-    httpx.patch(url, headers=headers, json={"message_id": message_id})
+    await http_client.patch(url, headers=headers, json={"message_id": message_id})
 
 def fmt_prezzo(prezzo) -> str:
     try:
@@ -109,17 +112,20 @@ def build_summary(box: dict) -> str:
         lines.append(f"• **{variant}** → <@{uid}>")
     return "\n".join(lines)
 
+def build_view_from_box(box_id: str, box: dict) -> "BoxView":
+    """Costruisce una BoxView dai dati già caricati (senza chiamate al DB)."""
+    view = BoxView(box_id)
+    view.populate(box)
+    return view
+
 class BoxView(discord.ui.View):
     def __init__(self, box_id: str):
         super().__init__(timeout=None)
         self.box_id = box_id
-        self._build_buttons()
 
-    def _build_buttons(self):
+    def populate(self, box: dict):
+        """Costruisce i bottoni dai dati della box (nessuna chiamata al DB)."""
         self.clear_items()
-        box = load_box(self.box_id)
-        if not box:
-            return
         variants = get_variants(box)
         variant_names = list(variants.keys())
 
@@ -147,54 +153,66 @@ class BoxView(discord.ui.View):
 
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
-            box = load_box(self.box_id)
+            # ACK immediato: da qui in poi abbiamo 15 minuti, non 3 secondi
+            await interaction.response.defer()
+
+            box = await load_box(self.box_id)
             if not box:
-                await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
+                await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
                 return
+
             variants = get_variants(box)
             user_id = str(interaction.user.id)
+
             if variants[variant]["reserved_by"] is not None:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"⚠️ **{variant}** è già stata prenotata!", ephemeral=True)
                 return
+
             variants[variant]["reserved_by"] = user_id
             variants[variant]["reserved_at"] = datetime.now().isoformat()
-            update_variants(self.box_id, variants)
+            await update_variants(self.box_id, variants)
+
             box["variants"] = variants
-            embed = build_embed(box, self.box_id)
-            self._build_buttons()
+            self.populate(box)
             all_reserved = all(v["reserved_by"] is not None for v in variants.values())
-            await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
+
+            # Modifica il messaggio della box (quello su cui sta il bottone)
+            await interaction.message.edit(embed=build_embed(box, self.box_id), view=self)
+            await interaction.followup.send(
+                f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
+
             if all_reserved:
                 await interaction.channel.send(f"🏆 **Box completata!**\n\n{build_summary(box)}")
         return callback
 
     async def cancel_callback(self, interaction: discord.Interaction):
-        box = load_box(self.box_id)
+        await interaction.response.defer(ephemeral=True)
+
+        box = await load_box(self.box_id)
         if not box:
-            await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
+            await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
             return
+
         variants = get_variants(box)
         user_id = str(interaction.user.id)
         user_variants = [v for v, info in variants.items() if info["reserved_by"] == user_id]
 
         if not user_variants:
-            await interaction.response.send_message("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
             return
 
         if len(user_variants) == 1:
             found = user_variants[0]
             variants[found]["reserved_by"] = None
             variants[found]["reserved_at"] = None
-            update_variants(self.box_id, variants)
+            await update_variants(self.box_id, variants)
             box["variants"] = variants
-            embed = build_embed(box, self.box_id)
-            self._build_buttons()
-            await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(
-                f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**."
-            )
+            self.populate(box)
+            await interaction.message.edit(embed=build_embed(box, self.box_id), view=self)
+            await interaction.followup.send(f"↩️ Prenotazione di **{found}** annullata!", ephemeral=True)
+            await interaction.channel.send(
+                f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**.")
             return
 
         # Più prenotazioni: menu di selezione
@@ -202,42 +220,44 @@ class BoxView(discord.ui.View):
             placeholder="Quale variante vuoi annullare?",
             options=[discord.SelectOption(label=v, value=v) for v in user_variants]
         )
+        box_message = interaction.message  # riferimento al messaggio della box
 
         async def select_callback(si: discord.Interaction):
+            await si.response.defer()
+
             chosen = select.values[0]
-            b2 = load_box(self.box_id)
+            b2 = await load_box(self.box_id)
+            if not b2:
+                await si.followup.send("❌ Box non trovata.", ephemeral=True)
+                return
             v2 = get_variants(b2)
 
-            # Verifica che la prenotazione sia ancora dell'utente
             if v2.get(chosen, {}).get("reserved_by") != str(si.user.id):
-                await si.response.edit_message(content="⚠️ Questa prenotazione non risulta più tua.", view=None)
+                await si.edit_original_response(content="⚠️ Questa prenotazione non risulta più tua.", view=None)
                 return
 
             v2[chosen]["reserved_by"] = None
             v2[chosen]["reserved_at"] = None
-            update_variants(self.box_id, v2)
+            await update_variants(self.box_id, v2)
             b2["variants"] = v2
 
-            # Conferma nel messaggio effimero del menu
-            await si.response.edit_message(content=f"↩️ Prenotazione di **{chosen}** annullata!", view=None)
+            # Chiudi il menu con conferma
+            await si.edit_original_response(content=f"↩️ Prenotazione di **{chosen}** annullata!", view=None)
 
-            # Aggiorna il messaggio PRINCIPALE della box (non quello effimero!)
-            self._build_buttons()
+            # Aggiorna il messaggio principale della box
+            self.populate(b2)
             try:
-                msg_id = b2.get("message_id")
-                if msg_id:
-                    box_msg = await si.channel.fetch_message(int(msg_id))
-                    await box_msg.edit(embed=build_embed(b2, self.box_id), view=self)
+                await box_message.edit(embed=build_embed(b2, self.box_id), view=self)
             except Exception as e:
                 print(f"[CANCEL] Errore aggiornamento messaggio box: {e}")
 
-            # Notifica pubblica nel canale
-            await si.channel.send(f"↩️ **{si.user.display_name}** ha annullato la prenotazione di **{chosen}**.")
+            await si.channel.send(
+                f"↩️ **{si.user.display_name}** ha annullato la prenotazione di **{chosen}**.")
 
         select.callback = select_callback
         cv = discord.ui.View(timeout=180)
         cv.add_item(select)
-        await interaction.response.send_message("Quale prenotazione vuoi annullare?", view=cv, ephemeral=True)
+        await interaction.followup.send("Quale prenotazione vuoi annullare?", view=cv, ephemeral=True)
 
 class BlindBoxCog(commands.Cog):
     def __init__(self, bot):
@@ -252,9 +272,11 @@ class BlindBoxCog(commands.Cog):
     )
     @app_commands.checks.has_permissions(manage_messages=True)
     async def newbox(self, interaction: discord.Interaction, nome: str, serie: str, varianti: str, prezzo: float):
+        await interaction.response.defer()
+
         variant_list = [v.strip() for v in varianti.split(",") if v.strip()]
         if len(variant_list) not in [6, 8, 9, 12]:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(variant_list)}.", ephemeral=True)
             return
 
@@ -267,20 +289,20 @@ class BlindBoxCog(commands.Cog):
             "channel_id": str(interaction.channel_id),
             "variants": {v: {"reserved_by": None, "reserved_at": None} for v in variant_list},
         }
-        save_box(box_id, box)
+        await save_box(box_id, box)
 
-        view = BoxView(box_id)
+        view = build_view_from_box(box_id, box)
         embed = build_embed(box, box_id)
-        await interaction.response.send_message(embed=embed, view=view)
-        msg = await interaction.original_response()
-        update_message_id(box_id, str(msg.id))
-        interaction.client.add_view(view)
+        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+        await update_message_id(box_id, str(msg.id))
+        interaction.client.add_view(view, message_id=msg.id)
 
     @app_commands.command(name="listbox", description="Mostra tutte le box attive")
     async def listbox(self, interaction: discord.Interaction):
-        all_boxes = load_all_boxes()
+        await interaction.response.defer(ephemeral=True)
+        all_boxes = await load_all_boxes()
         if not all_boxes:
-            await interaction.response.send_message("ℹ️ Nessuna box attiva al momento.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Nessuna box attiva al momento.", ephemeral=True)
             return
         lines = []
         for box_id, box in all_boxes.items():
@@ -291,15 +313,16 @@ class BlindBoxCog(commands.Cog):
             prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
             lines.append(f"• **{box['name']} {box['series']}** — {status} — {prezzo_str}/var | ID: `{box_id}`")
         embed = discord.Embed(title="📦 Box attive", description="\n".join(lines), color=discord.Color.blurple())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="boxinfo", description="Dettagli e prenotazioni di una box")
     @app_commands.describe(box_id="ID della box (usa /listbox per trovarlo)")
     @app_commands.checks.has_permissions(manage_messages=True)
     async def boxinfo(self, interaction: discord.Interaction, box_id: str):
-        box = load_box(box_id)
+        await interaction.response.defer(ephemeral=True)
+        box = await load_box(box_id)
         if not box:
-            await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
+            await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
             return
         variants = get_variants(box)
         prezzo_str = fmt_prezzo(box.get("prezzo", "?"))
@@ -314,25 +337,29 @@ class BlindBoxCog(commands.Cog):
             description=f"💰 {prezzo_str} a variante\n\n" + "\n".join(lines),
             color=discord.Color.gold(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="deletebox", description="Elimina una box (solo admin)")
     @app_commands.describe(box_id="ID della box da eliminare")
     @app_commands.checks.has_permissions(administrator=True)
     async def deletebox(self, interaction: discord.Interaction, box_id: str):
-        box = load_box(box_id)
+        await interaction.response.defer(ephemeral=True)
+        box = await load_box(box_id)
         if not box:
-            await interaction.response.send_message("❌ Box non trovata.", ephemeral=True)
+            await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
             return
-        delete_box(box_id)
-        await interaction.response.send_message(f"🗑️ Box `{box_id}` eliminata.", ephemeral=True)
+        await delete_box_db(box_id)
+        await interaction.followup.send(f"🗑️ Box `{box_id}` eliminata.", ephemeral=True)
 
     @newbox.error
     @boxinfo.error
     @deletebox.error
     async def permission_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message("🚫 Non hai i permessi.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("🚫 Non hai i permessi.", ephemeral=True)
+            else:
+                await interaction.response.send_message("🚫 Non hai i permessi.", ephemeral=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -342,17 +369,32 @@ class BlindBoxBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        global http_client
+        http_client = httpx.AsyncClient(timeout=10.0)
+
         await self.add_cog(BlindBoxCog(self))
         guild = discord.Object(id=1442484265475506207)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        all_boxes = load_all_boxes()
-        for box_id in all_boxes:
-            self.add_view(BoxView(box_id))
-        print(f"✅ Comandi slash sincronizzati sul server. {len(all_boxes)} box ripristinate da Supabase.")
+
+        # Ripristina le view persistenti da Supabase
+        all_boxes = await load_all_boxes()
+        for box_id, box in all_boxes.items():
+            view = build_view_from_box(box_id, box)
+            msg_id = box.get("message_id")
+            if msg_id:
+                self.add_view(view, message_id=int(msg_id))
+            else:
+                self.add_view(view)
+        print(f"✅ Comandi slash sincronizzati. {len(all_boxes)} box ripristinate da Supabase.")
 
     async def on_ready(self):
         print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id})")
+
+    async def close(self):
+        if http_client:
+            await http_client.aclose()
+        await super().close()
 
 bot = BlindBoxBot()
 
