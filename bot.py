@@ -4,6 +4,7 @@ from discord import app_commands
 import os
 import json
 import time
+import random
 import asyncio
 from datetime import datetime
 import httpx
@@ -11,6 +12,7 @@ import httpx
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GUILD_ID = 1442484265475506207
 
 http_client: httpx.AsyncClient | None = None
 
@@ -46,9 +48,10 @@ async def load_box(box_id: str) -> dict | None:
         return None
     return rows[0]
 
-async def save_box(box_id: str, box: dict):
+async def save_box(box_id: str, box: dict) -> bool:
     url = f"{SUPABASE_URL}/rest/v1/boxes"
-    headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
+    # Niente merge-duplicates: se l'ID esiste già vogliamo un errore, non una sovrascrittura
+    headers = {**sb_headers(), "Prefer": "return=representation"}
     payload = {
         "box_id": box_id,
         "name": box["name"],
@@ -61,7 +64,10 @@ async def save_box(box_id: str, box: dict):
         "variants": json.dumps(box["variants"]),
     }
     r = await http_client.post(url, headers=headers, json=payload)
-    print(f"[SAVE_BOX] status={r.status_code}")
+    if r.status_code not in (200, 201):
+        print(f"[SAVE_BOX] ERRORE status={r.status_code} body={r.text[:200]}")
+        return False
+    return True
 
 async def delete_box_db(box_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
@@ -80,6 +86,16 @@ async def update_message_id(box_id: str, message_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
     headers = {**sb_headers(), "Prefer": "return=representation"}
     await http_client.patch(url, headers=headers, json={"message_id": message_id})
+
+async def generate_unique_box_id() -> str:
+    """Genera un ID corto e verifica che non esista già."""
+    for _ in range(5):
+        box_id = f"{str(int(time.time()))[-6:]}{random.randint(10, 99)}"
+        existing = await load_box(box_id)
+        if existing is None:
+            return box_id
+    # Fallback estremamente improbabile
+    return str(int(time.time() * 1000))[-10:]
 
 def fmt_prezzo(prezzo) -> str:
     try:
@@ -129,7 +145,7 @@ class BoxView(discord.ui.View):
         super().__init__(timeout=None)
         self.box_id = box_id
 
-    def populate(self, box: dict):
+    def populate(self, box: dict, locked: bool = False):
         self.clear_items()
         variants = get_variants(box)
         variant_names = list(variants.keys())
@@ -138,10 +154,10 @@ class BoxView(discord.ui.View):
             info = variants[variant]
             taken = info["reserved_by"] is not None
             btn = discord.ui.Button(
-                label=f"{'✅' if taken else '🎁'} {variant}",
+                label=f"{'✅' if taken else '🎁'} {variant}"[:80],
                 style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
                 custom_id=f"b{self.box_id}_v{i}",
-                disabled=taken,
+                disabled=taken or locked,
                 row=i // 5,
             )
             btn.callback = self._make_callback(variant)
@@ -152,6 +168,7 @@ class BoxView(discord.ui.View):
             style=discord.ButtonStyle.danger,
             custom_id=f"cx_{self.box_id}",
             row=4,
+            disabled=locked,
         )
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
@@ -164,47 +181,65 @@ class BoxView(discord.ui.View):
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
             await interaction.response.defer()
-
-            async with get_lock(self.box_id):
-                box = await load_box(self.box_id)
-                if not box:
-                    await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
-                    return
-
-                variants = get_variants(box)
-                user_id = str(interaction.user.id)
-
-                if variants[variant]["reserved_by"] is not None:
-                    # Stato cambiato nel frattempo: riallinea il messaggio
-                    box["variants"] = variants
-                    await self.refresh_box_message(interaction.message, box)
+            try:
+                await self._do_reserve(interaction, variant)
+            except Exception as e:
+                print(f"[RESERVE] Errore inatteso: {e}")
+                try:
                     await interaction.followup.send(
-                        f"⚠️ **{variant}** è già stata prenotata!", ephemeral=True)
-                    return
+                        "❌ Qualcosa è andato storto, riprova tra qualche secondo.", ephemeral=True)
+                except Exception:
+                    pass
+        return callback
 
-                variants[variant]["reserved_by"] = user_id
-                variants[variant]["reserved_at"] = datetime.now().isoformat()
+    async def _do_reserve(self, interaction: discord.Interaction, variant: str):
+        async with get_lock(self.box_id):
+            box = await load_box(self.box_id)
+            if not box:
+                await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
+                return
 
-                ok = await update_variants(self.box_id, variants)
-                if not ok:
-                    await interaction.followup.send(
-                        "❌ Errore di salvataggio, riprova tra qualche secondo.", ephemeral=True)
-                    return
+            variants = get_variants(box)
+            user_id = str(interaction.user.id)
 
+            if variants[variant]["reserved_by"] is not None:
                 box["variants"] = variants
                 await self.refresh_box_message(interaction.message, box)
-                all_reserved = all(v["reserved_by"] is not None for v in variants.values())
+                await interaction.followup.send(
+                    f"⚠️ **{variant}** è già stata prenotata!", ephemeral=True)
+                return
 
-            # Fuori dal lock: notifiche
-            await interaction.followup.send(
-                f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
-            if all_reserved:
-                await interaction.channel.send(f"🏆 **Box completata!**\n\n{build_summary(box)}")
-        return callback
+            variants[variant]["reserved_by"] = user_id
+            variants[variant]["reserved_at"] = datetime.now().isoformat()
+
+            ok = await update_variants(self.box_id, variants)
+            if not ok:
+                await interaction.followup.send(
+                    "❌ Errore di salvataggio, riprova tra qualche secondo.", ephemeral=True)
+                return
+
+            box["variants"] = variants
+            await self.refresh_box_message(interaction.message, box)
+            all_reserved = all(v["reserved_by"] is not None for v in variants.values())
+
+        await interaction.followup.send(
+            f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
+        if all_reserved:
+            await interaction.channel.send(f"🏆 **Box completata!**\n\n{build_summary(box)}")
 
     async def cancel_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
+        try:
+            await self._handle_cancel(interaction)
+        except Exception as e:
+            print(f"[CANCEL] Errore inatteso: {e}")
+            try:
+                await interaction.followup.send(
+                    "❌ Qualcosa è andato storto, riprova tra qualche secondo.", ephemeral=True)
+            except Exception:
+                pass
 
+    async def _handle_cancel(self, interaction: discord.Interaction):
         box = await load_box(self.box_id)
         if not box:
             await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
@@ -223,10 +258,9 @@ class BoxView(discord.ui.View):
             await self._do_cancel(interaction, interaction.message, user_variants[0], user_id)
             return
 
-        # Più prenotazioni: menu di selezione
         select = discord.ui.Select(
             placeholder="Quale variante vuoi annullare?",
-            options=[discord.SelectOption(label=v, value=v) for v in user_variants]
+            options=[discord.SelectOption(label=v[:100], value=v[:100]) for v in user_variants]
         )
         box_message = interaction.message
 
@@ -238,10 +272,23 @@ class BoxView(discord.ui.View):
                     content=f"↩️ Annullamento di **{chosen}** in corso...", view=None)
             except Exception:
                 pass
-            await self._do_cancel(si, box_message, chosen, str(si.user.id))
+            try:
+                await self._do_cancel(si, box_message, chosen, str(si.user.id))
+            except Exception as e:
+                print(f"[CANCEL-SELECT] Errore inatteso: {e}")
 
         select.callback = select_callback
         cv = discord.ui.View(timeout=180)
+
+        async def on_timeout():
+            try:
+                # Disabilita il menu scaduto per evitare "interazione non riuscita"
+                for item in cv.children:
+                    item.disabled = True
+            except Exception:
+                pass
+        cv.on_timeout = on_timeout
+
         cv.add_item(select)
         await interaction.followup.send("Quale prenotazione vuoi annullare?", view=cv, ephemeral=True)
 
@@ -276,6 +323,7 @@ class BoxView(discord.ui.View):
         await interaction.channel.send(
             f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{variant}**.")
 
+@app_commands.guild_only()
 class BlindBoxCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -292,12 +340,40 @@ class BlindBoxCog(commands.Cog):
         await interaction.response.defer()
 
         variant_list = [v.strip() for v in varianti.split(",") if v.strip()]
+
+        # Validazione: numero varianti
         if len(variant_list) not in [6, 8, 9, 12]:
             await interaction.followup.send(
                 f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(variant_list)}.", ephemeral=True)
             return
 
-        box_id = str(int(time.time()))[-8:]
+        # Validazione: duplicati
+        seen, duplicates = set(), set()
+        for v in variant_list:
+            key = v.lower()
+            if key in seen:
+                duplicates.add(v)
+            seen.add(key)
+        if duplicates:
+            await interaction.followup.send(
+                f"⚠️ Ci sono varianti duplicate: **{', '.join(duplicates)}**. Ogni variante deve essere unica.",
+                ephemeral=True)
+            return
+
+        # Validazione: lunghezza nomi (limite bottoni Discord: 80 caratteri, 3 usati dall'emoji)
+        too_long = [v for v in variant_list if len(v) > 75]
+        if too_long:
+            await interaction.followup.send(
+                f"⚠️ Questi nomi sono troppo lunghi (max 75 caratteri): **{', '.join(v[:30] + '…' for v in too_long)}**",
+                ephemeral=True)
+            return
+
+        # Validazione: prezzo
+        if prezzo <= 0:
+            await interaction.followup.send("⚠️ Il prezzo deve essere maggiore di zero.", ephemeral=True)
+            return
+
+        box_id = await generate_unique_box_id()
         box = {
             "name": nome, "series": serie, "prezzo": prezzo,
             "created_by": str(interaction.user.id),
@@ -306,7 +382,11 @@ class BlindBoxCog(commands.Cog):
             "channel_id": str(interaction.channel_id),
             "variants": {v: {"reserved_by": None, "reserved_at": None} for v in variant_list},
         }
-        await save_box(box_id, box)
+        ok = await save_box(box_id, box)
+        if not ok:
+            await interaction.followup.send(
+                "❌ Errore nel salvataggio della box, riprova.", ephemeral=True)
+            return
 
         view = BoxView(box_id)
         view.populate(box)
@@ -390,6 +470,20 @@ class BlindBoxCog(commands.Cog):
         if not box:
             await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
             return
+
+        # Disattiva il messaggio della box su Discord prima di eliminarla dal DB
+        msg_id = box.get("message_id")
+        if msg_id:
+            try:
+                channel = interaction.client.get_channel(int(box["channel_id"])) or interaction.channel
+                msg = await channel.fetch_message(int(msg_id))
+                closed_embed = build_embed(box, box_id)
+                closed_embed.color = discord.Color.dark_grey()
+                closed_embed.title = f"🚫 [ELIMINATA] {closed_embed.title}"
+                await msg.edit(embed=closed_embed, view=None)
+            except Exception as e:
+                print(f"[DELETEBOX] Impossibile aggiornare il messaggio: {e}")
+
         await delete_box_db(box_id)
         await interaction.followup.send(f"🗑️ Box `{box_id}` eliminata.", ephemeral=True)
 
@@ -399,10 +493,17 @@ class BlindBoxCog(commands.Cog):
     @refreshbox.error
     async def permission_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
+            msg = "🚫 Non hai i permessi."
+        else:
+            print(f"[COMMAND] Errore inatteso: {error}")
+            msg = "❌ Qualcosa è andato storto, riprova."
+        try:
             if interaction.response.is_done():
-                await interaction.followup.send("🚫 Non hai i permessi.", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             else:
-                await interaction.response.send_message("🚫 Non hai i permessi.", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -416,7 +517,7 @@ class BlindBoxBot(commands.Bot):
         http_client = httpx.AsyncClient(timeout=10.0)
 
         await self.add_cog(BlindBoxCog(self))
-        guild = discord.Object(id=1442484265475506207)
+        guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
 
