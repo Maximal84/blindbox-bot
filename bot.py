@@ -50,7 +50,7 @@ def save_box(box_id: str, box: dict):
         "variants": json.dumps(box["variants"]),
     }
     r = httpx.post(url, headers=headers, json=payload)
-    print(f"[SAVE_BOX] status={r.status_code} response={r.text[:200]}")
+    print(f"[SAVE_BOX] status={r.status_code}")
 
 def delete_box(box_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
@@ -119,38 +119,31 @@ class BoxView(discord.ui.View):
         self.clear_items()
         box = load_box(self.box_id)
         if not box:
-            print(f"[BUILD_BUTTONS] box {self.box_id} non trovata!")
             return
         variants = get_variants(box)
         variant_names = list(variants.keys())
-        print(f"[BUILD_BUTTONS] box={self.box_id} varianti={variant_names}")
 
         for i, variant in enumerate(variant_names):
             info = variants[variant]
             taken = info["reserved_by"] is not None
-            cid = f"b{self.box_id}_v{i}"
-            print(f"[BUILD_BUTTONS] bottone {i}: label='{variant}' custom_id='{cid}' ({len(cid)} chars) row={i//5}")
             btn = discord.ui.Button(
                 label=f"{'✅' if taken else '🎁'} {variant}",
                 style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
-                custom_id=cid,
+                custom_id=f"b{self.box_id}_v{i}",
                 disabled=taken,
                 row=i // 5,
             )
             btn.callback = self._make_callback(variant)
             self.add_item(btn)
 
-        cid_cancel = f"cx_{self.box_id}"
-        print(f"[BUILD_BUTTONS] bottone annulla: custom_id='{cid_cancel}' ({len(cid_cancel)} chars) row=4")
         cancel_btn = discord.ui.Button(
             label="❌ Annulla la mia prenotazione",
             style=discord.ButtonStyle.danger,
-            custom_id=cid_cancel,
+            custom_id=f"cx_{self.box_id}",
             row=4,
         )
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
-        print(f"[BUILD_BUTTONS] totale bottoni aggiunti: {len(self.children)}")
 
     def _make_callback(self, variant: str):
         async def callback(interaction: discord.Interaction):
@@ -185,9 +178,11 @@ class BoxView(discord.ui.View):
         variants = get_variants(box)
         user_id = str(interaction.user.id)
         user_variants = [v for v, info in variants.items() if info["reserved_by"] == user_id]
+
         if not user_variants:
-            await interaction.response.send_message("ℹ️ Nessuna prenotazione attiva.", ephemeral=True)
+            await interaction.response.send_message("ℹ️ Non hai nessuna prenotazione attiva in questa box.", ephemeral=True)
             return
+
         if len(user_variants) == 1:
             found = user_variants[0]
             variants[found]["reserved_by"] = None
@@ -197,24 +192,50 @@ class BoxView(discord.ui.View):
             embed = build_embed(box, self.box_id)
             self._build_buttons()
             await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(f"↩️ **{interaction.user.display_name}** ha annullato **{found}**.")
+            await interaction.followup.send(
+                f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{found}**."
+            )
             return
+
+        # Più prenotazioni: menu di selezione
         select = discord.ui.Select(
             placeholder="Quale variante vuoi annullare?",
             options=[discord.SelectOption(label=v, value=v) for v in user_variants]
         )
+
         async def select_callback(si: discord.Interaction):
             chosen = select.values[0]
             b2 = load_box(self.box_id)
             v2 = get_variants(b2)
+
+            # Verifica che la prenotazione sia ancora dell'utente
+            if v2.get(chosen, {}).get("reserved_by") != str(si.user.id):
+                await si.response.edit_message(content="⚠️ Questa prenotazione non risulta più tua.", view=None)
+                return
+
             v2[chosen]["reserved_by"] = None
             v2[chosen]["reserved_at"] = None
             update_variants(self.box_id, v2)
             b2["variants"] = v2
-            await si.response.edit_message(embed=build_embed(b2, self.box_id), view=self)
-            await si.followup.send(f"↩️ **{si.user.display_name}** ha annullato **{chosen}**.")
+
+            # Conferma nel messaggio effimero del menu
+            await si.response.edit_message(content=f"↩️ Prenotazione di **{chosen}** annullata!", view=None)
+
+            # Aggiorna il messaggio PRINCIPALE della box (non quello effimero!)
+            self._build_buttons()
+            try:
+                msg_id = b2.get("message_id")
+                if msg_id:
+                    box_msg = await si.channel.fetch_message(int(msg_id))
+                    await box_msg.edit(embed=build_embed(b2, self.box_id), view=self)
+            except Exception as e:
+                print(f"[CANCEL] Errore aggiornamento messaggio box: {e}")
+
+            # Notifica pubblica nel canale
+            await si.channel.send(f"↩️ **{si.user.display_name}** ha annullato la prenotazione di **{chosen}**.")
+
         select.callback = select_callback
-        cv = discord.ui.View(timeout=30)
+        cv = discord.ui.View(timeout=180)
         cv.add_item(select)
         await interaction.response.send_message("Quale prenotazione vuoi annullare?", view=cv, ephemeral=True)
 
@@ -238,8 +259,6 @@ class BlindBoxCog(commands.Cog):
             return
 
         box_id = str(int(time.time()))[-8:]
-        print(f"[NEWBOX] box_id={box_id} varianti={variant_list}")
-
         box = {
             "name": nome, "series": serie, "prezzo": prezzo,
             "created_by": str(interaction.user.id),
@@ -251,13 +270,11 @@ class BlindBoxCog(commands.Cog):
         save_box(box_id, box)
 
         view = BoxView(box_id)
-        print(f"[NEWBOX] view children count: {len(view.children)}")
         embed = build_embed(box, box_id)
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
         update_message_id(box_id, str(msg.id))
         interaction.client.add_view(view)
-        print(f"[NEWBOX] messaggio inviato id={msg.id}")
 
     @app_commands.command(name="listbox", description="Mostra tutte le box attive")
     async def listbox(self, interaction: discord.Interaction):
@@ -326,7 +343,6 @@ class BlindBoxBot(commands.Bot):
 
     async def setup_hook(self):
         await self.add_cog(BlindBoxCog(self))
-        # Sincronizzazione immediata sul server specifico
         guild = discord.Object(id=1442484265475506207)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
