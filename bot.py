@@ -9,7 +9,7 @@ import asyncio
 from datetime import datetime
 import httpx
 
-BOT_VERSION = "v16-interaction-edit"
+BOT_VERSION = "v17-ban-system"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -88,6 +88,102 @@ async def update_message_id(box_id: str, message_id: str):
     url = f"{SUPABASE_URL}/rest/v1/boxes?box_id=eq.{box_id}"
     headers = {**sb_headers(), "Prefer": "return=representation"}
     await http_client.patch(url, headers=headers, json={"message_id": message_id})
+
+
+# ── Gestione ban/infrazioni ──────────────────────────────────────
+from datetime import timedelta
+
+INFRACTION_WINDOW_DAYS = 30
+BAN_DURATIONS = {1: 3, 2: 7}  # infrazione -> giorni di ban; 3+ = permanente
+
+async def load_ban(user_id: str) -> dict | None:
+    url = f"{SUPABASE_URL}/rest/v1/bans?user_id=eq.{user_id}&select=*"
+    r = await http_client.get(url, headers=sb_headers())
+    rows = r.json()
+    if not isinstance(rows, list) or len(rows) == 0:
+        return None
+    return rows[0]
+
+async def save_ban(record: dict) -> bool:
+    url = f"{SUPABASE_URL}/rest/v1/bans"
+    headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
+    payload = {
+        "user_id": record["user_id"],
+        "infractions": record["infractions"],
+        "last_infraction_at": record.get("last_infraction_at"),
+        "banned_until": record.get("banned_until"),
+        "permanent": record.get("permanent", False),
+        "history": json.dumps(record.get("history", [])) if not isinstance(record.get("history"), str) else record["history"],
+    }
+    r = await http_client.post(url, headers=headers, json=payload)
+    if r.status_code not in (200, 201):
+        print(f"[SAVE_BAN] ERRORE status={r.status_code} body={r.text[:200]}")
+        return False
+    return True
+
+async def delete_ban(user_id: str):
+    url = f"{SUPABASE_URL}/rest/v1/bans?user_id=eq.{user_id}"
+    await http_client.delete(url, headers=sb_headers())
+
+def get_history(record: dict) -> list:
+    h = record.get("history", [])
+    if isinstance(h, str):
+        return json.loads(h)
+    return h
+
+async def is_user_banned(user_id: str) -> tuple[bool, str | None]:
+    """Ritorna (è_bannato, messaggio). Gestisce scadenza ban automatica."""
+    record = await load_ban(user_id)
+    if not record:
+        return False, None
+    if record.get("permanent"):
+        return True, "🚫 Sei stato bannato permanentemente dal sistema di prenotazioni. Contatta lo staff."
+    banned_until = record.get("banned_until")
+    if banned_until:
+        until = datetime.fromisoformat(banned_until)
+        if datetime.now() < until:
+            giorni = (until - datetime.now()).days
+            ore = int((until - datetime.now()).total_seconds() // 3600) % 24
+            return True, f"🚫 Sei temporaneamente bloccato dalle prenotazioni (ancora ~{giorni}g {ore}h). Motivo: annullamento a split completato."
+    return False, None
+
+async def register_infraction(user_id: str, box_id: str, variant: str) -> str:
+    """Registra un'infrazione e applica il ban progressivo. Ritorna messaggio per l'utente."""
+    record = await load_ban(user_id)
+    now = datetime.now()
+
+    if record is None:
+        record = {"user_id": user_id, "infractions": 0, "last_infraction_at": None,
+                  "banned_until": None, "permanent": False, "history": []}
+
+    # Reset contatore se l'ultima infrazione è più vecchia di 30 giorni
+    last = record.get("last_infraction_at")
+    if last:
+        last_dt = datetime.fromisoformat(last)
+        if (now - last_dt) > timedelta(days=INFRACTION_WINDOW_DAYS):
+            record["infractions"] = 0
+
+    record["infractions"] += 1
+    record["last_infraction_at"] = now.isoformat()
+
+    history = get_history(record)
+    history.append({"box_id": box_id, "variant": variant, "at": now.isoformat(),
+                    "infraction_number": record["infractions"]})
+    record["history"] = history
+
+    n = record["infractions"]
+    if n >= 3:
+        record["permanent"] = True
+        record["banned_until"] = None
+        msg = "🚫 **Ban permanente.** Hai annullato a split completato per la 3ª volta. Solo un admin può sbloccarti."
+    else:
+        giorni = BAN_DURATIONS[n]
+        record["banned_until"] = (now + timedelta(days=giorni)).isoformat()
+        record["permanent"] = False
+        msg = f"🚫 **Sei stato bloccato per {giorni} giorni** dalle prenotazioni (infrazione #{n}). Annullare a split completato penalizza tutti gli altri partecipanti."
+
+    await save_ban(record)
+    return msg
 
 async def generate_unique_box_id() -> str:
     """Genera un ID corto e verifica che non esista già."""
@@ -213,6 +309,12 @@ class BoxView(discord.ui.View):
         return callback
 
     async def _do_reserve(self, interaction: discord.Interaction, variant: str):
+        # Blocco utenti bannati
+        banned, ban_msg = await is_user_banned(str(interaction.user.id))
+        if banned:
+            await interaction.followup.send(ban_msg, ephemeral=True)
+            return
+
         async with get_lock(self.box_id):
             box = await load_box(self.box_id)
             if not box:
@@ -328,6 +430,9 @@ class BoxView(discord.ui.View):
                     "⚠️ Questa prenotazione non risulta più tua.", ephemeral=True)
                 return
 
+            # La box era completa PRIMA di questo annullamento?
+            was_complete = all(v["reserved_by"] is not None for v in variants.values())
+
             variants[variant]["reserved_by"] = None
             variants[variant]["reserved_at"] = None
 
@@ -340,8 +445,17 @@ class BoxView(discord.ui.View):
             box["variants"] = variants
             await self.refresh_box_message(box_message, box, interaction)
 
+        # Notifica pubblica dell'annullamento
         await interaction.channel.send(
             f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{variant}**.")
+
+        # Se la box era completa, scatta l'infrazione
+        if was_complete:
+            ban_msg = await register_infraction(user_id, self.box_id, variant)
+            await interaction.followup.send(ban_msg, ephemeral=True)
+            await interaction.channel.send(
+                f"⚠️ **{interaction.user.display_name}** ha annullato una prenotazione a split **già completato**."
+            )
 
 @app_commands.guild_only()
 class BlindBoxCog(commands.Cog):
@@ -507,10 +621,78 @@ class BlindBoxCog(commands.Cog):
         await delete_box_db(box_id)
         await interaction.followup.send(f"🗑️ Box `{box_id}` eliminata.", ephemeral=True)
 
+    @app_commands.command(name="unban", description="Sblocca un utente dal sistema prenotazioni (admin)")
+    @app_commands.describe(utente="L'utente da sbloccare")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def unban(self, interaction: discord.Interaction, utente: discord.User):
+        await interaction.response.defer(ephemeral=True)
+        record = await load_ban(str(utente.id))
+        if not record:
+            await interaction.followup.send(
+                f"ℹ️ {utente.mention} non ha ban o infrazioni registrate.", ephemeral=True)
+            return
+        await delete_ban(str(utente.id))
+        await interaction.followup.send(
+            f"✅ {utente.mention} è stato sbloccato e il suo contatore di infrazioni è stato azzerato.",
+            ephemeral=True)
+
+    @app_commands.command(name="baninfo", description="Mostra stato ban e storico di un utente (admin)")
+    @app_commands.describe(utente="L'utente da controllare")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def baninfo(self, interaction: discord.Interaction, utente: discord.User):
+        await interaction.response.defer(ephemeral=True)
+        record = await load_ban(str(utente.id))
+        if not record:
+            await interaction.followup.send(
+                f"✅ {utente.mention} è pulito: nessuna infrazione registrata.", ephemeral=True)
+            return
+
+        infractions = record.get("infractions", 0)
+        permanent = record.get("permanent", False)
+        banned_until = record.get("banned_until")
+        last = record.get("last_infraction_at")
+
+        if permanent:
+            stato = "🔴 **BAN PERMANENTE**"
+        elif banned_until and datetime.fromisoformat(banned_until) > datetime.now():
+            until = datetime.fromisoformat(banned_until)
+            stato = f"🟠 Bloccato fino al **{until.strftime('%d/%m/%Y %H:%M')}**"
+        else:
+            stato = "🟢 Nessun blocco attivo"
+
+        lines = [
+            f"**Utente:** {utente.mention}",
+            f"**Stato:** {stato}",
+            f"**Infrazioni totali:** {infractions}",
+        ]
+        if last:
+            last_dt = datetime.fromisoformat(last)
+            giorni_fa = (datetime.now() - last_dt).days
+            lines.append(f"**Ultima infrazione:** {last_dt.strftime('%d/%m/%Y')} ({giorni_fa}g fa)")
+            scadenza = last_dt + timedelta(days=INFRACTION_WINDOW_DAYS)
+            if scadenza > datetime.now() and not permanent:
+                lines.append(f"**Contatore si azzera il:** {scadenza.strftime('%d/%m/%Y')}")
+
+        history = get_history(record)
+        if history:
+            lines.append("\n**Storico annullamenti a split completato:**")
+            for h in history[-5:]:
+                at = datetime.fromisoformat(h["at"]).strftime("%d/%m/%Y")
+                lines.append(f"• #{h['infraction_number']} — **{h['variant']}** (box `{h['box_id']}`) il {at}")
+
+        embed = discord.Embed(
+            title="📋 Info ban utente",
+            description="\n".join(lines),
+            color=discord.Color.red() if (permanent or banned_until) else discord.Color.green(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     @newbox.error
     @boxinfo.error
     @deletebox.error
     @refreshbox.error
+    @unban.error
+    @baninfo.error
     async def permission_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
             msg = "🚫 Non hai i permessi."
