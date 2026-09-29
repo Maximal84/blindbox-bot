@@ -9,7 +9,7 @@ import asyncio
 from datetime import datetime, timedelta
 import httpx
 
-BOT_VERSION = "v20-router"
+BOT_VERSION = "v21-ack-first"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -67,7 +67,6 @@ async def delete_box_db(box_id: str):
     await http_client.delete(url, headers=sb_headers())
 
 async def delete_boxes_bulk(box_ids: list[str]) -> int:
-    """Elimina più box in poche chiamate invece di una per box."""
     removed = 0
     for i in range(0, len(box_ids), 50):
         chunk = box_ids[i:i + 50]
@@ -238,11 +237,11 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
 def build_summary(box: dict) -> str:
     lines = [f"**Riepilogo prenotazioni** — {fmt_prezzo(box.get('prezzo','?'))} a variante:"]
     for variant, info in get_variants(box).items():
-        lines.append(f"• **{variant}** → <@{info['reserved_by']}>")
+        uid = info["reserved_by"]
+        lines.append(f"• **{variant}** → <@{uid}>" if uid else f"• **{variant}** → *libera*")
     return "\n".join(lines)
 
 def build_components(box_id: str, box: dict) -> discord.ui.View:
-    """Costruisce SOLO i componenti visivi. I click sono gestiti dal router in on_interaction."""
     view = discord.ui.View(timeout=None)
     variants = get_variants(box)
     for i, variant in enumerate(list(variants.keys())):
@@ -258,95 +257,119 @@ def build_components(box_id: str, box: dict) -> discord.ui.View:
     ))
     return view
 
-async def safe_reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+# ── Invio robusto: ogni notifica è indipendente ──────────────────
+async def notify_user(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """Messaggio all'utente. Se il followup fallisce, non propaga l'errore."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(content, ephemeral=ephemeral)
+        return True
     except Exception as e:
-        print(f"[REPLY] fallito: {e}")
+        print(f"[NOTIFY_USER] fallito: {type(e).__name__}: {e}")
+        return False
+
+async def notify_channel(channel, content: str):
+    """Messaggio nel canale, indipendente dall'interazione. Non propaga errori."""
+    try:
+        await channel.send(content)
+        return True
+    except Exception as e:
+        print(f"[NOTIFY_CHANNEL] fallito: {type(e).__name__}: {e}")
+        return False
 
 async def show_state(interaction: discord.Interaction, box_message: discord.Message,
                      box_id: str, box: dict):
-    """Aggiorna embed+bottoni rispondendo direttamente all'interazione quando possibile."""
+    """Aggiorna embed+bottoni insieme, in un'unica modifica."""
     view = build_components(box_id, box)
     embed = build_embed(box, box_id)
     same = (interaction.message is not None and box_message is not None
             and interaction.message.id == box_message.id)
     try:
-        if same and not interaction.response.is_done():
-            await interaction.response.edit_message(embed=embed, view=view)
-            print(f"[STATE] box={box_id} risposta diretta OK")
+        if same:
+            await interaction.edit_original_response(embed=embed, view=view)
+            print(f"[STATE] box={box_id} aggiornato via interazione")
         else:
             await box_message.edit(embed=embed, view=view)
-            print(f"[STATE] box={box_id} edit messaggio OK")
-    except discord.NotFound:
-        print(f"[STATE] box={box_id} interazione scaduta, fallback edit")
+            print(f"[STATE] box={box_id} aggiornato via messaggio")
+        return True
+    except Exception as e:
+        print(f"[STATE] box={box_id} via interazione fallito ({type(e).__name__}), provo edit diretto")
         try:
             await box_message.edit(embed=embed, view=view)
-        except Exception as e:
-            print(f"[STATE] fallback fallito: {e}")
+            return True
+        except Exception as e2:
+            print(f"[STATE] box={box_id} edit diretto FALLITO: {e2}")
+            return False
 
-# ── Logica prenotazione / annullamento ───────────────────────────
+# ── Prenotazione ─────────────────────────────────────────────────
 async def handle_reserve(interaction: discord.Interaction, box_id: str, index: int):
     user_id = str(interaction.user.id)
     box_message = interaction.message
+    channel = interaction.channel
 
     banned, ban_msg = await is_user_banned(user_id)
     if banned:
-        await safe_reply(interaction, ban_msg)
+        await notify_user(interaction, ban_msg)
         return
 
+    t_lock = time.monotonic()
     async with get_lock(box_id):
+        attesa = time.monotonic() - t_lock
+        if attesa > 0.5:
+            print(f"[LOCK] box={box_id} atteso {attesa:.2f}s in coda")
+
         box = await load_box(box_id)
         if not box:
-            await safe_reply(interaction, "❌ Box non trovata (potrebbe essere stata eliminata).")
+            await notify_user(interaction, "❌ Box non trovata (potrebbe essere stata eliminata).")
             return
         variants = get_variants(box)
         names = list(variants.keys())
         if index >= len(names):
-            await safe_reply(interaction, "❌ Variante non valida.")
+            await notify_user(interaction, "❌ Variante non valida.")
             return
         variant = names[index]
 
         if variants[variant]["reserved_by"] is not None:
             box["variants"] = variants
             await show_state(interaction, box_message, box_id, box)
-            await safe_reply(interaction, f"⚠️ **{variant}** è già stata prenotata!")
+            await notify_user(interaction, f"⚠️ **{variant}** è già stata prenotata da qualcun altro!")
             return
 
         variants[variant]["reserved_by"] = user_id
         variants[variant]["reserved_at"] = datetime.now().isoformat()
         if not await update_variants(box_id, variants):
-            await safe_reply(interaction, "❌ Errore di salvataggio, riprova tra qualche secondo.")
+            await notify_user(interaction, "❌ Errore di salvataggio, riprova tra qualche secondo.")
             return
 
         box["variants"] = variants
         await show_state(interaction, box_message, box_id, box)
         all_reserved = all(v["reserved_by"] is not None for v in variants.values())
 
-    try:
-        await interaction.followup.send(
-            f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
-        if all_reserved:
-            await interaction.channel.send(f"🏆 **Box completata!**\n\n{build_summary(box)}")
-    except Exception as e:
-        print(f"[RESERVE] notifica fallita: {e}")
+    # Notifiche INDIPENDENTI: se una fallisce, l'altra parte comunque
+    ok = await notify_channel(
+        channel, f"🎉 **{interaction.user.display_name}** ha prenotato **{variant}**!")
+    if not ok:
+        await notify_user(interaction, f"✅ Hai prenotato **{variant}**!")
 
+    if all_reserved:
+        await notify_channel(channel, f"🏆 **Box completata!** Tutte le varianti sono prenotate.\n\n{build_summary(box)}")
+
+# ── Annullamento ─────────────────────────────────────────────────
 async def handle_cancel_click(interaction: discord.Interaction, box_id: str):
     user_id = str(interaction.user.id)
     box_message = interaction.message
 
     box = await load_box(box_id)
     if not box:
-        await safe_reply(interaction, "❌ Box non trovata.")
+        await notify_user(interaction, "❌ Box non trovata.")
         return
     variants = get_variants(box)
     mine = [v for v, info in variants.items() if info["reserved_by"] == user_id]
 
     if not mine:
-        await safe_reply(interaction, "ℹ️ Non hai nessuna prenotazione attiva in questa box.")
+        await notify_user(interaction, "ℹ️ Non hai nessuna prenotazione attiva in questa box.")
         return
 
     if len(mine) == 1:
@@ -359,41 +382,44 @@ async def handle_cancel_click(interaction: discord.Interaction, box_id: str):
         custom_id=f"sc_{box_id}_{box_message.id}",
         options=[discord.SelectOption(label=v[:100], value=v[:100]) for v in mine],
     ))
+    await notify_user(interaction, "Quale prenotazione vuoi annullare?")
     try:
-        await interaction.response.send_message(
-            "Quale prenotazione vuoi annullare?", view=view, ephemeral=True)
+        await interaction.followup.send("⬇️", view=view, ephemeral=True)
     except Exception as e:
         print(f"[CANCEL] invio menu fallito: {e}")
 
 async def handle_cancel_select(interaction: discord.Interaction, box_id: str,
                                box_message_id: int, chosen: str):
     try:
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"↩️ Annullamento di **{chosen}** in corso...", view=None)
     except Exception as e:
-        print(f"[CANCEL-SEL] risposta fallita: {e}")
+        print(f"[CANCEL-SEL] aggiornamento menu fallito: {e}")
     try:
         box_message = await interaction.channel.fetch_message(box_message_id)
     except Exception as e:
         print(f"[CANCEL-SEL] messaggio box non recuperato: {e}")
-        await safe_reply(interaction, "❌ Non trovo il messaggio della box.")
+        await notify_user(interaction, "❌ Non trovo il messaggio della box.")
         return
     await do_cancel(interaction, box_message, box_id, chosen, str(interaction.user.id))
 
 async def do_cancel(interaction: discord.Interaction, box_message: discord.Message,
                     box_id: str, variant: str, user_id: str):
+    channel = interaction.channel
     was_complete = False
+    box = None
+
     async with get_lock(box_id):
         box = await load_box(box_id)
         if not box:
-            await safe_reply(interaction, "❌ Box non trovata.")
+            await notify_user(interaction, "❌ Box non trovata.")
             return
         variants = get_variants(box)
 
         if variants.get(variant, {}).get("reserved_by") != user_id:
             box["variants"] = variants
             await show_state(interaction, box_message, box_id, box)
-            await safe_reply(interaction, "⚠️ Questa prenotazione non risulta più tua.")
+            await notify_user(interaction, "⚠️ Questa prenotazione non risulta più tua.")
             return
 
         was_complete = all(v["reserved_by"] is not None for v in variants.values())
@@ -401,26 +427,30 @@ async def do_cancel(interaction: discord.Interaction, box_message: discord.Messa
         variants[variant]["reserved_at"] = None
 
         if not await update_variants(box_id, variants):
-            await safe_reply(interaction, "❌ Errore di salvataggio, riprova tra qualche secondo.")
+            await notify_user(interaction, "❌ Errore di salvataggio, riprova tra qualche secondo.")
             return
 
         box["variants"] = variants
         await show_state(interaction, box_message, box_id, box)
 
-    try:
-        await interaction.channel.send(
-            f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{variant}**.")
-    except Exception as e:
-        print(f"[CANCEL] notifica fallita: {e}")
+    # Ogni notifica è indipendente dalle altre
+    await notify_channel(
+        channel, f"↩️ **{interaction.user.display_name}** ha annullato la prenotazione di **{variant}**.")
 
     if was_complete:
-        ban_msg = await register_infraction(user_id, box_id, variant)
-        await safe_reply(interaction, ban_msg)
+        # Lo split era concluso: avviso pubblico + stato aggiornato + infrazione
+        await notify_channel(
+            channel,
+            f"⚠️ **Split riaperto!** {interaction.user.display_name} ha annullato a split **già completato**.\n"
+            f"🔓 Si è liberata la variante **{variant}** — è di nuovo prenotabile!\n\n"
+            f"{build_summary(box)}")
         try:
-            await interaction.channel.send(
-                f"⚠️ **{interaction.user.display_name}** ha annullato una prenotazione a split **già completato**.")
-        except Exception:
-            pass
+            ban_msg = await register_infraction(user_id, box_id, variant)
+            await notify_user(interaction, ban_msg)
+        except Exception as e:
+            print(f"[INFRACTION] errore registrazione: {type(e).__name__}: {e}")
+    else:
+        await notify_user(interaction, f"↩️ Prenotazione di **{variant}** annullata.")
 
 # ── Comandi ──────────────────────────────────────────────────────
 @app_commands.guild_only()
@@ -512,6 +542,24 @@ class BlindBoxCog(commands.Cog):
             title=f"📋 {box['name']} — {box['series']}",
             description=f"💰 {fmt_prezzo(box.get('prezzo','?'))} a variante\n\n" + "\n".join(lines),
             color=discord.Color.gold()), ephemeral=True)
+
+    @app_commands.command(name="riepilogo", description="Ripubblica il riepilogo di una box nel canale")
+    @app_commands.describe(box_id="ID della box")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def riepilogo(self, interaction: discord.Interaction, box_id: str):
+        print(f"[CMD] /riepilogo {box_id}")
+        await interaction.response.defer(ephemeral=True)
+        box = await load_box(box_id)
+        if not box:
+            await interaction.followup.send("❌ Box non trovata.", ephemeral=True)
+            return
+        variants = get_variants(box)
+        completa = all(v["reserved_by"] is not None for v in variants.values())
+        testa = ("🏆 **Box completata!** Tutte le varianti sono prenotate."
+                 if completa else "📋 **Stato attuale della box**")
+        await notify_channel(interaction.channel,
+                             f"{testa}\n\n**{box['name']} — {box['series']}**\n{build_summary(box)}")
+        await interaction.followup.send("✅ Riepilogo pubblicato nel canale.", ephemeral=True)
 
     @app_commands.command(name="refreshbox", description="Riallinea il messaggio di una box (admin)")
     @app_commands.describe(box_id="ID della box")
@@ -633,15 +681,17 @@ class BlindBoxCog(commands.Cog):
     @cleanup.error
     @unban.error
     @baninfo.error
+    @riepilogo.error
     async def permission_error(self, interaction: discord.Interaction, error):
         msg = "🚫 Non hai i permessi." if isinstance(error, app_commands.MissingPermissions) \
               else "❌ Qualcosa è andato storto, riprova."
         if not isinstance(error, app_commands.MissingPermissions):
             print(f"[COMMAND] Errore: {type(error).__name__}: {error}")
-        await safe_reply(interaction, msg)
+        await notify_user(interaction, msg)
 
 # ── Bot ──────────────────────────────────────────────────────────
 intents = discord.Intents.default()
+intents.message_content = True
 
 class BlindBoxBot(commands.Bot):
     def __init__(self):
@@ -654,27 +704,43 @@ class BlindBoxBot(commands.Bot):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        # NESSUNA view registrata: i click sono gestiti dal router in on_interaction
-        print(f"✅ Comandi sincronizzati. Router attivo (nessuna view da ripristinare).")
+        print("✅ Comandi sincronizzati. Router attivo.")
         self.loop.create_task(self.heartbeat())
 
     async def heartbeat(self):
         await self.wait_until_ready()
         while not self.is_closed():
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)
             print(f"[HEARTBEAT] vivo — latenza gateway {self.latency*1000:.0f}ms")
 
     async def on_ready(self):
         print(f"🤖 Bot connesso come {self.user} (ID: {self.user.id}) — VERSIONE: {BOT_VERSION}")
 
     async def on_interaction(self, interaction: discord.Interaction):
-        """Router: gestisce TUTTI i click, per qualunque box, senza view registrate."""
         if interaction.type != discord.InteractionType.component:
             return
         data = interaction.data or {}
         cid = data.get("custom_id", "")
+        if not (cid.startswith("cx_") or cid.startswith("sc_")
+                or (cid.startswith("b") and "_v" in cid)):
+            return
+
         t0 = time.monotonic()
         print(f"[CLICK] custom_id='{cid}' user={interaction.user.id}")
+
+        # ACK IMMEDIATO, prima di qualsiasi query o lock: da qui abbiamo 15 minuti
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            print(f"[CLICK] interazione già scaduta all'arrivo cid='{cid}'")
+            return
+        except discord.InteractionResponded:
+            pass
+        except Exception as e:
+            print(f"[CLICK] defer fallito: {type(e).__name__}: {e}")
+            return
+        print(f"[CLICK] ack in {time.monotonic()-t0:.2f}s")
+
         try:
             if cid.startswith("cx_"):
                 await handle_cancel_click(interaction, cid[3:])
@@ -683,17 +749,13 @@ class BlindBoxBot(commands.Bot):
                 values = data.get("values") or []
                 if values:
                     await handle_cancel_select(interaction, box_id, int(msg_id), values[0])
-            elif cid.startswith("b") and "_v" in cid:
+            else:
                 base, idx = cid.rsplit("_v", 1)
                 await handle_reserve(interaction, base[1:], int(idx))
-            else:
-                return
             print(f"[CLICK] completato in {time.monotonic()-t0:.2f}s")
-        except discord.NotFound:
-            print(f"[CLICK] interazione scaduta (>3s) cid='{cid}'")
         except Exception as e:
             print(f"[CLICK] Errore: {type(e).__name__}: {e}")
-            await safe_reply(interaction, "❌ Qualcosa è andato storto, riprova tra qualche secondo.")
+            await notify_user(interaction, "❌ Qualcosa è andato storto, riprova tra qualche secondo.")
 
     async def close(self):
         if http_client:
