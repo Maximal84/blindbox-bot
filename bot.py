@@ -6,15 +6,24 @@ import json
 import time
 import random
 import asyncio
+import re
 from datetime import datetime, timedelta
 import httpx
 
-BOT_VERSION = "v21-ack-first"
+BOT_VERSION = "v22-36-varianti"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GUILD_ID = 1442484265475506207
+
+MIN_VARIANTS = 2
+MAX_VARIANTS = 36
+BUTTON_MAX_VARIANTS = 20   # fino a 20 varianti: un bottone ciascuna; oltre: menu a tendina
+MENU_MAX_OPTIONS = 25      # limite Discord di voci per menu a tendina
+EMBED_FIELD_LIMIT = 1024   # limite Discord di caratteri per campo dell'embed
+MESSAGE_LIMIT = 1900       # margine sotto il limite Discord di 2000 caratteri per messaggio
+MENU_RE = re.compile(r"m(\d+)_(\d+)")
 
 http_client: httpx.AsyncClient | None = None
 box_locks: dict[str, asyncio.Lock] = {}
@@ -217,12 +226,26 @@ def get_variants(box: dict) -> dict:
     v = box["variants"]
     return json.loads(v) if isinstance(v, str) else v
 
+def chunk_lines(lines: list[str], limit: int) -> list[str]:
+    """Raggruppa le righe in blocchi che non superano `limit` caratteri."""
+    chunks, cur, size = [], [], 0
+    for line in lines:
+        add = len(line) + (1 if cur else 0)
+        if cur and size + add > limit:
+            chunks.append("\n".join(cur))
+            cur, size, add = [], 0, len(line)
+        cur.append(line)
+        size += add
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
 def build_embed(box: dict, box_id: str) -> discord.Embed:
     variants = get_variants(box)
     total = len(variants)
     taken = sum(1 for v in variants.values() if v["reserved_by"] is not None)
     embed = discord.Embed(
-        title=f"🎁 {box['name']} — {box['series']}",
+        title=f"🎁 {box['name']} — {box['series']}"[:256],
         description=f"**{taken}/{total}** varianti prenotate  •  💰 **{fmt_prezzo(box.get('prezzo','?'))} a variante**",
         color=discord.Color.green() if taken == total else discord.Color.blurple(),
     )
@@ -231,26 +254,45 @@ def build_embed(box: dict, box_id: str) -> discord.Embed:
     for variant, info in variants.items():
         lines.append(f"✅ ~~{variant}~~ — *prenotata*" if info["reserved_by"]
                      else f"🎁 **{variant}** — libera")
-    embed.add_field(name="Varianti", value="\n".join(lines), inline=False)
+    for idx, parte in enumerate(chunk_lines(lines, EMBED_FIELD_LIMIT)):
+        embed.add_field(name="Varianti" if idx == 0 else "\u200b", value=parte, inline=False)
     return embed
 
-def build_summary(box: dict) -> str:
+def summary_lines(box: dict) -> list[str]:
     lines = [f"**Riepilogo prenotazioni** — {fmt_prezzo(box.get('prezzo','?'))} a variante:"]
     for variant, info in get_variants(box).items():
         uid = info["reserved_by"]
         lines.append(f"• **{variant}** → <@{uid}>" if uid else f"• **{variant}** → *libera*")
-    return "\n".join(lines)
+    return lines
 
 def build_components(box_id: str, box: dict) -> discord.ui.View:
+    """Fino a BUTTON_MAX_VARIANTS varianti: un bottone per variante (come prima).
+    Oltre: menu a tendina con le sole varianti libere, al massimo 25 voci per menu.
+    Discord ammette al massimo 25 componenti per messaggio, quindi 36 bottoni non ci stanno."""
     view = discord.ui.View(timeout=None)
     variants = get_variants(box)
-    for i, variant in enumerate(list(variants.keys())):
-        taken = variants[variant]["reserved_by"] is not None
-        view.add_item(discord.ui.Button(
-            label=f"{'✅' if taken else '🎁'} {variant}"[:80],
-            style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
-            custom_id=f"b{box_id}_v{i}", disabled=taken, row=i // 5,
-        ))
+    names = list(variants.keys())
+
+    if len(names) <= BUTTON_MAX_VARIANTS:
+        for i, variant in enumerate(names):
+            taken = variants[variant]["reserved_by"] is not None
+            view.add_item(discord.ui.Button(
+                label=f"{'✅' if taken else '🎁'} {variant}"[:80],
+                style=discord.ButtonStyle.success if taken else discord.ButtonStyle.primary,
+                custom_id=f"b{box_id}_v{i}", disabled=taken, row=i // 5,
+            ))
+    else:
+        liberi = [(i, n) for i, n in enumerate(names) if variants[n]["reserved_by"] is None]
+        gruppi = [liberi[k:k + MENU_MAX_OPTIONS] for k in range(0, len(liberi), MENU_MAX_OPTIONS)]
+        for k, gruppo in enumerate(gruppi):
+            parte = f" ({k + 1}/{len(gruppi)})" if len(gruppi) > 1 else ""
+            view.add_item(discord.ui.Select(
+                placeholder=f"🎁 Scegli la tua variante{parte} — {len(liberi)} libere"[:150],
+                custom_id=f"m{box_id}_{k}",
+                options=[discord.SelectOption(label=n[:100], value=str(i), emoji="🎁")
+                         for i, n in gruppo],
+                row=k,
+            ))
     view.add_item(discord.ui.Button(
         label="❌ Annulla la mia prenotazione", style=discord.ButtonStyle.danger,
         custom_id=f"cx_{box_id}", row=4,
@@ -279,6 +321,13 @@ async def notify_channel(channel, content: str):
         print(f"[NOTIFY_CHANNEL] fallito: {type(e).__name__}: {e}")
         return False
 
+async def notify_channel_long(channel, header: str, lines: list[str]):
+    """Come notify_channel, ma divide il testo su più messaggi se supera il limite."""
+    ok = True
+    for parte in chunk_lines([header] + lines, MESSAGE_LIMIT):
+        ok = await notify_channel(channel, parte) and ok
+    return ok
+
 async def show_state(interaction: discord.Interaction, box_message: discord.Message,
                      box_id: str, box: dict):
     """Aggiorna embed+bottoni insieme, in un'unica modifica."""
@@ -304,7 +353,8 @@ async def show_state(interaction: discord.Interaction, box_message: discord.Mess
             return False
 
 # ── Prenotazione ─────────────────────────────────────────────────
-async def handle_reserve(interaction: discord.Interaction, box_id: str, index: int):
+async def handle_reserve(interaction: discord.Interaction, box_id: str, index: int,
+                         from_menu: bool = False):
     user_id = str(interaction.user.id)
     box_message = interaction.message
     channel = interaction.channel
@@ -312,6 +362,11 @@ async def handle_reserve(interaction: discord.Interaction, box_id: str, index: i
     banned, ban_msg = await is_user_banned(user_id)
     if banned:
         await notify_user(interaction, ban_msg)
+        if from_menu:
+            # ripristina il menu, che altrimenti resta con la scelta selezionata
+            box = await load_box(box_id)
+            if box:
+                await show_state(interaction, box_message, box_id, box)
         return
 
     t_lock = time.monotonic()
@@ -354,7 +409,8 @@ async def handle_reserve(interaction: discord.Interaction, box_id: str, index: i
         await notify_user(interaction, f"✅ Hai prenotato **{variant}**!")
 
     if all_reserved:
-        await notify_channel(channel, f"🏆 **Box completata!** Tutte le varianti sono prenotate.\n\n{build_summary(box)}")
+        await notify_channel_long(channel, "🏆 **Box completata!** Tutte le varianti sono prenotate.\n",
+                                  summary_lines(box))
 
 # ── Annullamento ─────────────────────────────────────────────────
 async def handle_cancel_click(interaction: discord.Interaction, box_id: str):
@@ -376,13 +432,17 @@ async def handle_cancel_click(interaction: discord.Interaction, box_id: str):
         await do_cancel(interaction, box_message, box_id, mine[0], user_id)
         return
 
+    opzioni = mine[:MENU_MAX_OPTIONS]
     view = discord.ui.View(timeout=180)
     view.add_item(discord.ui.Select(
         placeholder="Quale variante vuoi annullare?",
         custom_id=f"sc_{box_id}_{box_message.id}",
-        options=[discord.SelectOption(label=v[:100], value=v[:100]) for v in mine],
+        options=[discord.SelectOption(label=v[:100], value=v[:100]) for v in opzioni],
     ))
-    await notify_user(interaction, "Quale prenotazione vuoi annullare?")
+    testo = "Quale prenotazione vuoi annullare?"
+    if len(mine) > MENU_MAX_OPTIONS:
+        testo += f" (mostrate le prime {MENU_MAX_OPTIONS} di {len(mine)})"
+    await notify_user(interaction, testo)
     try:
         await interaction.followup.send("⬇️", view=view, ephemeral=True)
     except Exception as e:
@@ -439,11 +499,11 @@ async def do_cancel(interaction: discord.Interaction, box_message: discord.Messa
 
     if was_complete:
         # Lo split era concluso: avviso pubblico + stato aggiornato + infrazione
-        await notify_channel(
+        await notify_channel_long(
             channel,
             f"⚠️ **Split riaperto!** {interaction.user.display_name} ha annullato a split **già completato**.\n"
-            f"🔓 Si è liberata la variante **{variant}** — è di nuovo prenotabile!\n\n"
-            f"{build_summary(box)}")
+            f"🔓 Si è liberata la variante **{variant}** — è di nuovo prenotabile!\n",
+            summary_lines(box))
         try:
             ban_msg = await register_infraction(user_id, box_id, variant)
             await notify_user(interaction, ban_msg)
@@ -460,15 +520,16 @@ class BlindBoxCog(commands.Cog):
 
     @app_commands.command(name="newbox", description="Crea una nuova full box da splittare")
     @app_commands.describe(nome="Nome (es. Skullpanda)", serie="Serie/edizione",
-                           varianti="Varianti separate da virgola", prezzo="Prezzo per variante")
+                           varianti="Varianti separate da virgola (da 2 a 36)", prezzo="Prezzo per variante")
     @app_commands.checks.has_permissions(manage_messages=True)
     async def newbox(self, interaction: discord.Interaction, nome: str, serie: str, varianti: str, prezzo: float):
         print(f"[CMD] /newbox da {interaction.user.id}")
         await interaction.response.defer()
         vl = [v.strip() for v in varianti.split(",") if v.strip()]
-        if len(vl) not in [6, 8, 9, 12]:
+        if not MIN_VARIANTS <= len(vl) <= MAX_VARIANTS:
             await interaction.followup.send(
-                f"⚠️ Le varianti devono essere 6, 8, 9 o 12. Hai inserito {len(vl)}.", ephemeral=True)
+                f"⚠️ Le varianti devono essere tra {MIN_VARIANTS} e {MAX_VARIANTS}. "
+                f"Hai inserito {len(vl)}.", ephemeral=True)
             return
         seen, dup = set(), set()
         for v in vl:
@@ -538,10 +599,13 @@ class BlindBoxCog(commands.Cog):
         for variant, info in get_variants(box).items():
             lines.append(f"✅ **{variant}** → <@{info['reserved_by']}>" if info["reserved_by"]
                          else f"🎁 **{variant}** → *libera*")
-        await interaction.followup.send(embed=discord.Embed(
-            title=f"📋 {box['name']} — {box['series']}",
-            description=f"💰 {fmt_prezzo(box.get('prezzo','?'))} a variante\n\n" + "\n".join(lines),
-            color=discord.Color.gold()), ephemeral=True)
+        emb = discord.Embed(
+            title=f"📋 {box['name']} — {box['series']}"[:256],
+            description=f"💰 {fmt_prezzo(box.get('prezzo','?'))} a variante",
+            color=discord.Color.gold())
+        for idx, parte in enumerate(chunk_lines(lines, EMBED_FIELD_LIMIT)):
+            emb.add_field(name="Prenotazioni" if idx == 0 else "\u200b", value=parte, inline=False)
+        await interaction.followup.send(embed=emb, ephemeral=True)
 
     @app_commands.command(name="riepilogo", description="Ripubblica il riepilogo di una box nel canale")
     @app_commands.describe(box_id="ID della box")
@@ -557,8 +621,9 @@ class BlindBoxCog(commands.Cog):
         completa = all(v["reserved_by"] is not None for v in variants.values())
         testa = ("🏆 **Box completata!** Tutte le varianti sono prenotate."
                  if completa else "📋 **Stato attuale della box**")
-        await notify_channel(interaction.channel,
-                             f"{testa}\n\n**{box['name']} — {box['series']}**\n{build_summary(box)}")
+        await notify_channel_long(interaction.channel,
+                                  f"{testa}\n\n**{box['name']} — {box['series']}**",
+                                  summary_lines(box))
         await interaction.followup.send("✅ Riepilogo pubblicato nel canale.", ephemeral=True)
 
     @app_commands.command(name="refreshbox", description="Riallinea il messaggio di una box (admin)")
@@ -721,7 +786,8 @@ class BlindBoxBot(commands.Bot):
             return
         data = interaction.data or {}
         cid = data.get("custom_id", "")
-        if not (cid.startswith("cx_") or cid.startswith("sc_")
+        menu = MENU_RE.fullmatch(cid)
+        if not (cid.startswith("cx_") or cid.startswith("sc_") or menu
                 or (cid.startswith("b") and "_v" in cid)):
             return
 
@@ -749,6 +815,10 @@ class BlindBoxBot(commands.Bot):
                 values = data.get("values") or []
                 if values:
                     await handle_cancel_select(interaction, box_id, int(msg_id), values[0])
+            elif menu:
+                values = data.get("values") or []
+                if values:
+                    await handle_reserve(interaction, menu.group(1), int(values[0]), from_menu=True)
             else:
                 base, idx = cid.rsplit("_v", 1)
                 await handle_reserve(interaction, base[1:], int(idx))
